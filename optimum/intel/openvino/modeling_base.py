@@ -471,6 +471,7 @@ class OVBaseModel(OptimizedModel):
         height: int = None,
         width: int = None,
     ):
+        return model
         shapes = {}
         for inputs in model.inputs:
             shapes[inputs] = inputs.get_partial_shape()
