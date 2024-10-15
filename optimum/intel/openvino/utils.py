@@ -131,6 +131,14 @@ PREDEFINED_SD_DATASETS = {
     "laion/filtered-wit": {"split": "train", "inputs": {"prompt": "caption"}},
 }
 
+PREDEFINED_VISUAL_LM_DATASETS = {
+    "contextual": {
+        "name": "ucla-contextual/contextual_test",
+        "split": "test",
+        "inputs": {"image_url": "image_url", "instruction": "instruction"},
+    }
+}
+
 
 NEED_CONVERT_TO_FAST_TOKENIZER: Tuple[Type[PreTrainedTokenizer]] = (CLIPTokenizer,)
 
