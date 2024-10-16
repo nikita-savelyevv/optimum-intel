@@ -533,7 +533,7 @@ class OVWeightCompressionTest(unittest.TestCase):
                 # TODO: Check that AWQ was actually applied
                 pass
 
-            ov_model = model
+            ov_model = model.model
             if model_cls == OVModelForVisualCausalLM:
                 ov_model = model.lm_model
 
