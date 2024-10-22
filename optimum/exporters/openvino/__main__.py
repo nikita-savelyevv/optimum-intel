@@ -390,6 +390,11 @@ def main_export(
         model_name_or_path, subfolder=subfolder, trust_remote_code=trust_remote_code
     )
 
+    if model.__class__.__name__ in ["LlavaNextForConditionalGeneration", "LlavaForConditionalGeneration"]:
+        from optimum.exporters.openvino.tome_patching import patch_llava_vit
+
+        patch_llava_vit(model)
+
     submodel_paths = export_from_model(
         model=model,
         output=output,

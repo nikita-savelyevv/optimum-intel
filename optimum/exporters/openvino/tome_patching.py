@@ -254,7 +254,58 @@ def make_mllama_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.
     return ToMeBlock
 
 
-def hook_tome_model(model: torch.nn.Module):
+def make_clip_encoder_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
+    """
+    This patch applies ToMe to the forward function of the block.
+    """
+
+    class ToMeBlock(block_class):
+        # Save for unpatching later
+        _parent = block_class
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor,
+            causal_attention_mask: torch.Tensor,
+            output_attentions: Optional[bool] = False,
+        ) -> Tuple[torch.FloatTensor]:
+            hidden_state = hidden_states
+
+            m_a, m_m, u_a, u_m = compute_merge(hidden_state, self._tome_info)
+
+            # Self Attention
+            residual = hidden_state
+            hidden_state = self.layer_norm1(hidden_state)
+
+            hidden_state, _ = merge_wavg(m_a, hidden_state)
+
+            hidden_state, attn_weights = self.self_attn(
+                hidden_states=hidden_state,
+                attention_mask=attention_mask,
+                causal_attention_mask=causal_attention_mask,
+                output_attentions=output_attentions,
+            )
+            hidden_state = residual + u_a(hidden_state)
+
+            # Feed forward
+            residual = hidden_state
+            hidden_state = self.layer_norm2(hidden_state)
+            hidden_state, _ = merge_wavg(m_m, hidden_state)
+            hidden_state = self.mlp(hidden_state)
+            hidden_state = residual + u_m(hidden_state)
+
+            outputs = (hidden_state,)
+
+            if output_attentions:
+                outputs += (attn_weights,)
+
+            return outputs
+
+    return ToMeBlock
+
+
+def mllama_hook_tome_model(model: torch.nn.Module):
     """Adds a forward pre hook to get the image size. This hook can be removed with remove_patch."""
 
     def hook(module, args):
@@ -263,6 +314,34 @@ def hook_tome_model(model: torch.nn.Module):
         return None
 
     model._tome_info["hooks"].append(model.register_forward_pre_hook(hook))
+
+
+def llava_hook_tome_model(model: torch.nn.Module):
+    """Adds a forward pre hook to get the image size. This hook can be removed with remove_patch."""
+
+    def hook(module, args, kwargs):
+        module._tome_info["size"] = kwargs["inputs_embeds"].shape[1]
+        print("shape", kwargs["inputs_embeds"].shape)
+        return None
+
+    model._tome_info["hooks"].append(model.register_forward_pre_hook(hook, with_kwargs=True))
+
+
+def remove_patch(model: torch.nn.Module):
+    """Removes a patch from a ToMe Diffusion module if it was already patched."""
+    # For mllama
+    model = model.unet if hasattr(model, "unet") else model
+
+    for _, module in model.named_modules():
+        if hasattr(module, "_tome_info"):
+            for hook in module._tome_info["hooks"]:
+                hook.remove()
+            module._tome_info["hooks"].clear()
+
+        if module.__class__.__name__ == "ToMeBlock":
+            module.__class__ = module._parent
+
+    return model
 
 
 def patch_mmlama_vit(
@@ -323,7 +402,7 @@ def patch_mmlama_vit(
             "merge_mlp": merge_mlp,
         },
     }
-    hook_tome_model(mmlama_vit1)
+    mllama_hook_tome_model(mmlama_vit1)
 
     for _, module in mmlama_vit1.named_modules():
         # If for some reason this has a different name, create an issue and I'll fix it
@@ -347,7 +426,7 @@ def patch_mmlama_vit(
             "merge_mlp": merge_mlp,
         },
     }
-    hook_tome_model(mmlama_vit2)
+    mllama_hook_tome_model(mmlama_vit2)
 
     for _, module in mmlama_vit2.named_modules():
         # If for some reason this has a different name, create an issue and I'll fix it
@@ -357,21 +436,72 @@ def patch_mmlama_vit(
             module.__class__ = make_tome_block_fn(module.__class__)
             module._tome_info = mmlama_vit2._tome_info
 
-    return model
 
+def patch_llava_vit(
+    model: torch.nn.Module,
+    ratio: float = 0.5,
+    max_downsample: int = 1,
+    sx: int = 2,
+    sy: int = 2,
+    use_rand: bool = True,
+    merge_attn: bool = True,
+    merge_mlp: bool = False,
+):
+    """
+    Patches a stable diffusion model with ToMe.
+    Apply this to the highest level stable diffusion object (i.e., it should have a .model.diffusion_model).
 
-def remove_patch(model: torch.nn.Module):
-    """Removes a patch from a ToMe Diffusion module if it was already patched."""
-    # For mllama
-    model = model.unet if hasattr(model, "unet") else model
+    Important Args:
+     - model: A top level Stable Diffusion module to patch in place. Should have a ".model.diffusion_model"
+     - ratio: The ratio of tokens to merge. I.e., 0.4 would reduce the total number of tokens by 40%.
+              The maximum value for this is 1-(1/(sx*sy)). By default, the max is 0.75 (I recommend <= 0.5 though).
+              Higher values result in more speed-up, but with more visual quality loss.
 
-    for _, module in model.named_modules():
-        if hasattr(module, "_tome_info"):
-            for hook in module._tome_info["hooks"]:
-                hook.remove()
-            module._tome_info["hooks"].clear()
+    Args to tinker with if you want:
+     - max_downsample [1, 2, 4, or 8]: Apply ToMe to layers with at most this amount of downsampling.
+                                       E.g., 1 only applies to layers with no downsampling (4/15) while
+                                       8 applies to all layers (15/15). I recommend a value of 1 or 2.
+     - sx, sy: The stride for computing dst sets (see paper). A higher stride means you can merge more tokens,
+               but the default of (2, 2) works well in most cases. Doesn't have to divide image size.
+     - use_rand: Whether or not to allow random perturbations when computing dst sets (see paper). Usually
+                 you'd want to leave this on, but if you're having weird artifacts try turning this off.
+     - merge_attn: Whether or not to merge tokens for attention (recommended).
+     - merge_mlp: Whether or not to merge tokens for the mlp layers (very not recommended).
+    """
 
-        if module.__class__.__name__ == "ToMeBlock":
-            module.__class__ = module._parent
+    # Make sure the module is not currently patched
+    remove_patch(model)
 
-    return model
+    is_llava = isinstance_str(model, "LlavaNextForConditionalGeneration") or isinstance_str(
+        model, "LlavaForConditionalGeneration"
+    )
+
+    if not is_llava:
+        raise RuntimeError("Provided model was not a Llava model.")
+    else:
+        # Supports "pipe.unet" and "unet"
+        llava_vit = model.vision_tower.vision_model.encoder
+
+    llava_vit._tome_info = {
+        "size": None,
+        "hooks": [],
+        "args": {
+            "ratio": ratio,
+            "max_downsample": max_downsample,
+            "sx": sx,
+            "sy": sy,
+            "use_rand": use_rand,
+            "generator": None,
+            "merge_attn": merge_attn,
+            "merge_mlp": merge_mlp,
+        },
+    }
+    llava_hook_tome_model(llava_vit)
+
+    for _, module in llava_vit.named_modules():
+        # If for some reason this has a different name, create an issue and I'll fix it
+        if isinstance_str(module, "CLIPEncoderLayer"):
+            print("Patched module in transformer")
+            make_tome_block_fn = make_clip_encoder_tome_block
+            module.__class__ = make_tome_block_fn(module.__class__)
+            module._tome_info = llava_vit._tome_info

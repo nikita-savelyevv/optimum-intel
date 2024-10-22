@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 import warnings
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -52,6 +53,7 @@ class OVModelWithEmbedForCausalLM(OVModelForCausalLM):
         super().__init__(
             model, config, device, dynamic_shapes, ov_config, model_save_dir, quantization_config, **kwargs
         )
+        self._infer_times = []
 
     def compile(self):
         if self.request is None:
@@ -155,8 +157,10 @@ class OVModelWithEmbedForCausalLM(OVModelForCausalLM):
             **kwargs,
         )
         # Run inference
+        start_time = time.perf_counter()
         self.request.start_async(inputs, share_inputs=True)
         self.request.wait()
+        self._infer_times.append(time.perf_counter() - start_time)
         logits = self.request.get_tensor("logits").data
         logits = torch.from_numpy(logits).to(self.device)
         past_key_values = ((),)
@@ -177,10 +181,13 @@ class OVVisionEmbedding(OVModelPart):
             self.hidden_states_output_names = [
                 key.get_any_name() for key in self.model.outputs[2:] if "hidden_states" in key.get_any_name()
             ]
+        self._infer_times = []
 
     def forward(self, pixel_values, **kwargs):
         self._compile()
+        start_time = time.perf_counter()
         result = self.request({"pixel_values": pixel_values})
+        self._infer_times.append(time.perf_counter() - start_time)
         last_hidden_state = result[0]
         hidden_states = None
         pooler_out = None
