@@ -321,6 +321,9 @@ class OVQuantizer(OptimumQuantizer):
     ):
         from optimum.intel.openvino.modeling_visual_language import OVModelForVisualCausalLM
 
+        import os
+        quantize_vision_encoder = os.environ.get("QUANTIZE_VISION_ENCODER", "0") == "1"
+
         if is_diffusers_available():
             from optimum.intel.openvino.modeling_diffusion import OVDiffusionPipeline
 
@@ -370,7 +373,8 @@ class OVQuantizer(OptimumQuantizer):
                 if isinstance(self.model, OVModelForCausalLM):
                     calibration_dataset = self._prepare_causal_lm_dataset(quantization_config)
                 elif isinstance(self.model, OVModelForVisualCausalLM):
-                    calibration_dataset = self._prepare_visual_causal_lm_dataset(quantization_config)
+                    calibration_dataset = self._prepare_visual_causal_lm_dataset(
+                        quantization_config, collect_vision_encoder_dataset=quantize_vision_encoder)
                 elif is_diffusers_available() and isinstance(self.model, OVDiffusionPipeline):
                     if not isinstance(quantization_config.dataset, str):
                         raise ValueError("Please provide dataset as one of the accepted dataset labels.")
@@ -433,8 +437,24 @@ class OVQuantizer(OptimumQuantizer):
                     self.model.clear_requests()
                 elif isinstance(self.model, OVModelForVisualCausalLM):
                     language_model = self.model.language_model
-                    _weight_only_quantization(language_model.model, quantization_config, calibration_dataset)
-                    sub_model_names = ["vision_embeddings", "text_embeddings"] + self.model.additional_parts
+                    sub_model_names = ["text_embeddings"] + self.model.additional_parts
+                    if quantize_vision_encoder:
+                        llm_dataset, vision_encoder_dataset = calibration_dataset
+                        self.model.vision_embeddings.model = nncf.quantize(
+                            self.model.vision_embeddings.model,
+                            vision_encoder_dataset,
+                            model_type=nncf.ModelType.TRANSFORMER
+                        )
+                        if not (quantization_config.quant_method == OVQuantizationMethod.AWQ or
+                                quantization_config.scale_estimation or
+                                quantization_config.gptq or
+                                quantization_config.sensitivity_metric is not None):
+                            llm_dataset = None
+                    else:
+                        sub_model_names += ["vision_embeddings"]
+                        llm_dataset = calibration_dataset
+                    _weight_only_quantization(language_model.model, quantization_config, llm_dataset)
+
                     sub_models = [getattr(self.model, f"{name}_model") for name in sub_model_names]
                     for sub_model in sub_models:
                         _weight_only_quantization(sub_model, OVWeightQuantizationConfig(bits=8, sym=False))
@@ -751,7 +771,7 @@ class OVQuantizer(OptimumQuantizer):
 
         return calibration_dataset
 
-    def _prepare_visual_causal_lm_dataset(self, config: OVWeightQuantizationConfig):
+    def _prepare_visual_causal_lm_dataset(self, config: OVWeightQuantizationConfig, collect_vision_encoder_dataset: bool = False):
         dataset_name = config.dataset
         if dataset_name not in PREDEFINED_VISUAL_LM_DATASETS:
             raise ValueError(
@@ -776,6 +796,13 @@ class OVQuantizer(OptimumQuantizer):
         dataset = datasets.load_dataset(dataset_metadata["name"], split=dataset_metadata["split"]).shuffle(seed=0)
         num_samples = min(config.num_samples or 128, len(dataset))
         dataset = islice(dataset, num_samples)
+
+        original_vision_encoder_request = None
+        collected_vision_encoder_inputs = []
+        if collect_vision_encoder_dataset:
+            self.model.vision_embeddings._compile()
+            original_vision_encoder_request = self.model.vision_embeddings.request
+            self.model.vision_embeddings.request = InferRequestWrapper(self.model.vision_embeddings.request, collected_vision_encoder_inputs)
 
         calibration_dataset = []
         for item in tqdm(dataset, desc="Collecting calibration dataset", total=num_samples):
@@ -810,6 +837,12 @@ class OVQuantizer(OptimumQuantizer):
             calibration_dataset.append(language_model_inputs)
 
         calibration_dataset = nncf.Dataset(calibration_dataset)
+
+        if collect_vision_encoder_dataset:
+            vision_encoder_dataset = nncf.Dataset(collected_vision_encoder_inputs)
+            self.model.vision_embeddings.request = original_vision_encoder_request
+            return calibration_dataset, vision_encoder_dataset
+
         return calibration_dataset
 
     def _prepare_text_generation_dataset(
