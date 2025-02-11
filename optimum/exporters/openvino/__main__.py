@@ -30,6 +30,7 @@ from optimum.exporters import TasksManager
 from optimum.exporters.onnx.base import OnnxConfig
 from optimum.exporters.onnx.constants import SDPA_ARCHS_ONNX_EXPORT_NOT_SUPPORTED
 from optimum.intel.utils.import_utils import (
+    NNCF_IMPORT_ERROR,
     is_nncf_available,
     is_openvino_tokenizers_available,
     is_openvino_version,
@@ -486,9 +487,7 @@ def main_export(
                 continue
 
             if not is_nncf_available():
-                raise ImportError(
-                    "Quantization of the weights requires nncf, please install it with `pip install nncf`"
-                )
+                raise ImportError(NNCF_IMPORT_ERROR.format("Applying weight quantization"))
 
             from optimum.intel.openvino.quantization import _weight_only_quantization
 

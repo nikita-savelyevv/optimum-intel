@@ -21,7 +21,12 @@ from typing import TYPE_CHECKING, Optional
 from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
 
 from ...exporters import TasksManager
-from ...intel.utils.import_utils import DIFFUSERS_IMPORT_ERROR, is_diffusers_available, is_nncf_available
+from ...intel.utils.import_utils import (
+    DIFFUSERS_IMPORT_ERROR,
+    NNCF_IMPORT_ERROR,
+    is_diffusers_available,
+    is_nncf_available,
+)
 from ...intel.utils.modeling_utils import _infer_library_from_model_name_or_path
 from ...utils.save_utils import maybe_load_preprocessors
 from ..base import BaseOptimumCLICommand, CommandInfo
@@ -345,7 +350,7 @@ class OVExportCommand(BaseOptimumCLICommand):
             ov_config = OVConfig(dtype=self.args.weight_format)
         else:
             if not is_nncf_available():
-                raise ImportError("Applying quantization requires nncf, please install it with `pip install nncf`")
+                raise ImportError(NNCF_IMPORT_ERROR.format("Applying quantization"))
 
             if self.args.weight_format is not None:
                 # For int4 quantization if no parameter is provided, then use the default config if exists
