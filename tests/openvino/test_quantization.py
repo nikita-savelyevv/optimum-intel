@@ -124,7 +124,6 @@ class OVQuantizerTest(unittest.TestCase):
                 dataset="wikitext2",
                 num_samples=1,
                 dtype="f8e4m3",
-                weight_only=False,
             ),
             [
                 13,
@@ -137,8 +136,8 @@ class OVQuantizerTest(unittest.TestCase):
             OVModelForCausalLM,
             "llama",
             dict(
-                weight_quantization_config=dict(bits=4, dtype="nf4", group_size=16, weight_only=True, ratio=0.5),
-                full_quantization_config=dict(dtype="f8e4m3", weight_only=False),
+                weight_quantization_config=dict(bits=4, dtype="nf4", group_size=16, ratio=0.5),
+                full_quantization_config=dict(dtype="f8e4m3"),
                 dataset="wikitext2",
                 num_samples=1,
             ),
@@ -1255,21 +1254,17 @@ class OVQuantizationConfigTest(unittest.TestCase):
             OVQuantizationConfig,
             None,
         ),
-        (dict(weight_only=True), OVWeightQuantizationConfig, None),
-        (dict(weight_only=False), OVQuantizationConfig, None),
-        (dict(abc="def", weight_only=False), OVQuantizationConfig, None),
-        (dict(abc="def", weight_only=True), OVWeightQuantizationConfig, None),
         (
-            dict(bits=8, fast_bias_correction=True, dataset="librispeech", weight_only=True),
+            dict(bits=8, fast_bias_correction=True, dataset="librispeech"),
             OVQuantizationConfig,
             None,
         ),
         (
-            dict(bits=4, dataset="wikitext2", weight_only=True),
+            dict(bits=4, dataset="wikitext2"),
             OVWeightQuantizationConfig,
             None,
         ),
-        (dict(bits=8, fast_bias_correction=True, weight_only=False), OVQuantizationConfig, None),
+        (dict(bits=8, fast_bias_correction=True), OVQuantizationConfig, None),
     )
 
     def get_default_configurations() -> dict:

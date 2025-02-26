@@ -815,7 +815,7 @@ class OVConfig(BaseConfig):
         self.save_onnx_model = save_onnx_model
         self.optimum_version = kwargs.pop("optimum_version", None)
         if isinstance(quantization_config, dict):
-            quantization_config = self.quantization_config_from_dict(quantization_config)
+            quantization_config = quantization_config_from_dict(quantization_config)
         self.quantization_config = quantization_config
         if self.quantization_config is not None:
             if isinstance(self.quantization_config, (OVWeightQuantizationConfig, OVQuantizationConfig)):
@@ -838,29 +838,6 @@ class OVConfig(BaseConfig):
             }
             for name, value in model_inputs.items()
         ]
-
-    @staticmethod
-    def quantization_config_from_dict(quantization_config: dict) -> OVQuantizationConfigBase:
-        if "weight_quantization_config" in quantization_config and "full_quantization_config" in quantization_config:
-            return OVMixedQuantizationConfig.from_dict(quantization_config)
-        wq_args = inspect.getfullargspec(OVWeightQuantizationConfig.__init__).args
-        q_args = inspect.getfullargspec(OVQuantizationConfig.__init__).args
-        weight_only = quantization_config.pop("weight_only", None)
-        config_keys = quantization_config.keys()
-        matches_wq_config_signature = all(arg_name in wq_args for arg_name in config_keys)
-        matches_q_config_signature = all(arg_name in q_args for arg_name in config_keys)
-        if matches_wq_config_signature == matches_q_config_signature:
-            if weight_only is None:
-                logger.warning(
-                    "Can't determine type of OV quantization config. Please specify explicitly whether you intend to "
-                    "run weight-only quantization or not with `weight_only` parameter. Creating an instance of "
-                    "OVWeightQuantizationConfig."
-                )
-                return OVWeightQuantizationConfig.from_dict(quantization_config)
-            matches_wq_config_signature = weight_only
-
-        config_type = OVWeightQuantizationConfig if matches_wq_config_signature else OVQuantizationConfig
-        return config_type.from_dict(quantization_config)
 
     def _to_dict_safe(self, to_diff_dict: bool = False) -> Dict[str, Any]:
         class ConfigStub:
@@ -989,3 +966,66 @@ class OVMixedQuantizationConfig(OVQuantizationConfigBase):
         result["weight_quantization_config"] = self.weight_quantization_config.to_dict()
         result["full_quantization_config"] = self.full_quantization_config.to_dict()
         return result
+
+
+class OVMultiQuantizationConfig(QuantizationConfigMixin):
+    def __init__(self, submodel_configs: Dict[str, Union[OVQuantizationConfigBase, dict, None]], **kwargs):
+        """
+        Configuration class for quantization scenario where different parts of the model can be quantized with
+        different configurations.
+
+        Args:
+            submodel_configs (`Dict[str, OVQuantizationConfigBase or dict or None]`):
+                A dictionary where keys are submodel names and values are corresponding quantization configurations.
+        """
+        super().__init__()
+
+        self.submodel_configs = {}
+        for name, config in submodel_configs.items():
+            if isinstance(config, dict):
+                config = quantization_config_from_dict(config)
+            elif isinstance(config, OVQuantizationConfigBase):
+                config = config.clone()
+            elif config is not None:
+                raise ValueError("Unsupported type of quantization config.")
+            self.submodel_configs[name] = config
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {}
+        for name, config in self.submodel_configs.items():
+            result[name] = config.to_dict()
+        return result
+
+
+def quantization_config_from_dict(quantization_config: dict) -> QuantizationConfigMixin:
+    if "submodel_configs" in quantization_config:
+        return OVMultiQuantizationConfig.from_dict(quantization_config)
+    if "weight_quantization_config" in quantization_config and "full_quantization_config" in quantization_config:
+        return OVMixedQuantizationConfig.from_dict(quantization_config)
+
+    # Try to infer whether the given dictionary represents OVWeightQuantizationConfig or OVQuantizationConfig
+    wq_args = inspect.getfullargspec(OVWeightQuantizationConfig.__init__).args
+    q_args = inspect.getfullargspec(OVQuantizationConfig.__init__).args
+    config_keys = quantization_config.keys()
+    matches_wq_config_signature = all(arg_name in wq_args for arg_name in config_keys)
+    matches_q_config_signature = all(arg_name in q_args for arg_name in config_keys)
+    if matches_wq_config_signature != matches_q_config_signature:
+        config_type = OVWeightQuantizationConfig if matches_wq_config_signature else OVQuantizationConfig
+        return config_type.from_dict(quantization_config)
+
+    try:
+        weight_quantization_config = OVWeightQuantizationConfig.from_dict(quantization_config)
+    except:
+        weight_quantization_config = None
+
+    try:
+        full_quantization_config = OVQuantizationConfig.from_dict(quantization_config)
+    except:
+        full_quantization_config = None
+
+    if (weight_quantization_config is None) == (full_quantization_config is None):
+        raise ValueError(
+            "Can't determine the type of OV quantization config."
+        )
+
+    return weight_quantization_config or full_quantization_config

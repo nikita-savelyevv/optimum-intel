@@ -80,6 +80,8 @@ from .utils import (
 if is_datasets_available():
     from datasets import Dataset
 
+DatasetType = Union["Dataset", nncf.Dataset, Iterable]
+
 register_module(ignored_algorithms=[])(Conv1D)
 
 core = Core()
@@ -213,7 +215,7 @@ class OVQuantizer(OptimumQuantizer):
 
     def quantize(
         self,
-        calibration_dataset: Optional[Union["Dataset", nncf.Dataset, Iterable]] = None,
+        calibration_dataset: Optional[Union[DatasetType, Dict[str, DatasetType]]] = None,
         save_directory: Optional[Union[str, Path]] = None,
         ov_config: OVConfig = None,
         file_name: Optional[str] = None,
@@ -319,7 +321,7 @@ class OVQuantizer(OptimumQuantizer):
         self,
         ov_config: OVConfig,
         save_directory: Union[str, Path] = None,
-        calibration_dataset: Optional[Union["Dataset", nncf.Dataset, Iterable]] = None,
+        calibration_dataset: Optional[Union[DatasetType, Dict[str, DatasetType]]] = None,
         batch_size: int = 1,
         data_collator: Optional[DataCollator] = None,
         remove_unused_columns: bool = True,
@@ -331,9 +333,6 @@ class OVQuantizer(OptimumQuantizer):
         if is_diffusers_available():
             from optimum.intel.openvino.modeling_diffusion import OVDiffusionPipeline
 
-        if save_directory is not None:
-            save_directory = Path(save_directory)
-            save_directory.mkdir(parents=True, exist_ok=True)
         quantization_config = ov_config.quantization_config
 
         if calibration_dataset is not None:
@@ -369,8 +368,7 @@ class OVQuantizer(OptimumQuantizer):
                 "Both `quantization_config.dataset` and `calibration_dataset` were provided for weight only "
                 "quantization. Will rely on `calibration_dataset`."
             )
-
-        if calibration_dataset is None and quantization_config.dataset is not None:
+        elif quantization_config.dataset is not None:
             from optimum.intel import OVModelForCausalLM
 
             if isinstance(self.model, OVModelForCausalLM):
@@ -457,6 +455,8 @@ class OVQuantizer(OptimumQuantizer):
             raise ValueError(f"Unsupported type of quantization config: {type(quantization_config)}")
 
         if save_directory is not None:
+            save_directory = Path(save_directory)
+            save_directory.mkdir(parents=True, exist_ok=True)
             self.model.save_pretrained(save_directory)
             ov_config.save_pretrained(save_directory)
 
