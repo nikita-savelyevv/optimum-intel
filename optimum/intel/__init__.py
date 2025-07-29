@@ -284,7 +284,7 @@ if TYPE_CHECKING:
         )
     else:
         from .openvino import (
-            OVCalibrationDataset,
+            CalibrationDataset,
             OVDynamicQuantizationConfig,
             OVMixedQuantizationConfig,
             OVPipelineQuantizationConfig,

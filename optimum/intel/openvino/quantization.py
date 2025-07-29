@@ -27,17 +27,21 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 import datasets
 import nncf
 import numpy as np
+import onnx
 import openvino
 import requests
 import torch
 import transformers
 from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
+from nncf.onnx.quantization.backend_parameters import BackendParameters
 from nncf.quantization.advanced_parameters import OverflowFix
 from nncf.torch import register_module
 from nncf.torch.initialization import PTInitializingDataLoader
+from onnxruntime import InferenceSession
 from openvino import Core, Tensor
 from openvino._offline_transformations import compress_quantize_weights_transformation
 from PIL import Image
+from optimum.onnxruntime import ORTModel, ORTModelForCausalLM
 from torch.utils._pytree import tree_map
 from torch.utils.data import DataLoader, RandomSampler
 from tqdm import tqdm
@@ -91,7 +95,7 @@ core = Core()
 logger = logging.getLogger(__name__)
 
 
-class OVCalibrationDataset(UserDict):
+class CalibrationDataset(UserDict):
     """
     A class to store calibration datasets for quantization with NNCF. Contains an instance of `nncf.Dataset` for each
     pipeline model component. For example, for a sequence-to-sequence pipeline with `encoder_model` and `decoder_model`
@@ -115,21 +119,6 @@ class OVCalibrationDataset(UserDict):
             return self.data[item]
         except KeyError:
             raise AttributeError
-
-
-class OVDataLoader(PTInitializingDataLoader):
-    def get_inputs(self, dataloader_output) -> Tuple[Tuple, Dict]:
-        return (), dataloader_output
-
-    @property
-    def batch_size(self):
-        batch_size = self._data_loader.batch_size
-        if is_accelerate_available():
-            from accelerate.data_loader import DataLoaderStateMixin
-
-            if batch_size is None and isinstance(self._data_loader, DataLoaderStateMixin):
-                batch_size = self._data_loader.total_batch_size
-        return batch_size
 
 
 class InferRequestWrapper:
@@ -227,7 +216,20 @@ class InferRequestWrapper:
         return getattr(self.request, attr)
 
 
-class OVCalibrationDatasetBuilder:
+class ORTSessionWrapper:
+    def __init__(
+        self,
+        session: Union[InferenceSession],
+        collected_inputs: List = None,
+    ):
+        self.session = session
+        self.collected_inputs = [] if collected_inputs is None else collected_inputs
+        
+    def run(self, output_names, input_feed, run_options=None):
+        self.collected_inputs.append(copy.deepcopy(input_feed))
+        return self.session.run(output_names, input_feed, run_options)
+
+class CalibrationDatasetBuilder:
     """
     A class to build calibration datasets for quantization with NNCF.
 
@@ -236,7 +238,7 @@ class OVCalibrationDatasetBuilder:
         - a name of the dataset from `datasets`;
         - a quantization config object containing dataset specification.
 
-    Returns calibration dataset as an instance of `OVCalibrationDataset` containing an `nncf.Dataset` for each model component.
+    Returns calibration dataset as an instance of `CalibrationDataset` containing an `nncf.Dataset` for each model component.
     For example, for a sequence-to-sequence model with `encoder_model` and `decoder_model` components, the dictionary
     will contain two keys: `encoder_model` and `decoder_model`.
     """
@@ -257,7 +259,7 @@ class OVCalibrationDatasetBuilder:
         signature = inspect.signature(self.model.forward)
         self._signature_columns = list(signature.parameters.keys())
 
-    def build_from_quantization_config(self, config: OVQuantizationConfigBase) -> OVCalibrationDataset:
+    def build_from_quantization_config(self, config: OVQuantizationConfigBase) -> CalibrationDataset:
         """
         Builds a calibration dataset from a quantization config object. Namely, `quantization_config.dataset` property
         is used to infer dataset name.
@@ -266,7 +268,221 @@ class OVCalibrationDatasetBuilder:
             config (`OVQuantizationConfigBase`):
                 The quantization configuration object.
         Returns:
-            A calibration dataset as an instance of `OVCalibrationDataset` containing an `nncf.Dataset` for each model component.
+            A calibration dataset as an instance of `CalibrationDataset` containing an `nncf.Dataset` for each model component.
+        """
+        raise NotImplementedError
+
+    def build_from_dataset_name(
+        self,
+        quantization_config: OVQuantizationConfigBase,
+        dataset_name: str,
+        num_samples: Optional[int] = None,
+        dataset_config_name: Optional[str] = None,
+        dataset_split: str = "train",
+        preprocess_function: Optional[Callable] = None,
+        preprocess_batch: bool = True,
+        token: Optional[Union[bool, str]] = None,
+        cache_dir: str = HUGGINGFACE_HUB_CACHE,
+        streaming: bool = False,
+        batch_size: Optional[int] = 1,
+        data_collator: Optional[DataCollator] = None,
+        remove_unused_columns: bool = False,
+        **dataset_kwargs,
+    ) -> CalibrationDataset:
+        """
+        Create the calibration `datasets.Dataset` to use for the post-training static quantization calibration step.
+
+        Args:
+            quantization_config (`OVQuantizationConfigBase`):
+                The quantization configuration object.
+            dataset_name (`str`):
+                The dataset repository name on the Hugging Face Hub or path to a local directory containing data files
+                in generic formats and optionally a dataset script, if it requires some code to read the data files.
+            dataset_config_name (`str`, *optional*):
+                The name of the dataset configuration.
+            num_samples (`int`, *optional*):
+                The maximum number of samples composing the calibration dataset.
+            dataset_split (`str`, defaults to `"train"`):
+                Which split of the dataset to use to perform the calibration step.
+            preprocess_function (`Callable`, *optional*):
+                Processing function to apply to each example after loading dataset.
+            preprocess_batch (`bool`, defaults to `True`):
+                Whether the `preprocess_function` should be batched.
+            token (Optional[Union[bool, str]], defaults to `None`):
+                The token to use as HTTP bearer authorization for remote files. If `True`, will use the token generated
+                when running `huggingface-cli login` (stored in `~/.huggingface`).
+            cache_dir (`str`, *optional*):
+                Caching directory for a calibration dataset.
+            streaming (`bool`, defaults to `False`):
+                Whether to load dataset in streaming mode.
+            batch_size (`int`, defaults to 1):
+                The number of calibration samples to load per batch.
+            data_collator (`DataCollator`, *optional*):
+                The function to use to form a batch from a list of elements of the calibration dataset.
+            remove_unused_columns (`bool`, defaults to `False`):
+                Whether to remove the columns unused by the model forward method.
+        Returns:
+            A calibration dataset as an instance of `CalibrationDataset` containing an `nncf.Dataset` for each model component.
+        """
+
+        if remove_unused_columns:
+            logger.warning("`remove_unused_columns` is deprecated and will be removed in optimum-intel v1.25.")
+
+        dataset = self.load_dataset(
+            dataset_name,
+            num_samples,
+            dataset_config_name,
+            dataset_split,
+            preprocess_function,
+            preprocess_batch,
+            token,
+            cache_dir,
+            streaming,
+            **dataset_kwargs,
+        )
+
+        return self.build_from_dataset(quantization_config, dataset, batch_size, data_collator, remove_unused_columns)
+
+    def build_from_dataset(
+        self,
+        quantization_config: OVQuantizationConfigBase,
+        dataset: Union["Dataset", List],
+        batch_size: Optional[int] = 1,
+        data_collator: Optional[DataCollator] = None,
+        remove_unused_columns: bool = False,
+    ) -> CalibrationDataset:
+        """
+
+        Args:
+            quantization_config (`OVQuantizationConfigBase`):
+                The quantization configuration object.
+            dataset (`Union[datasets.Dataset, List]`):
+                The dataset to collect calibration data from.
+            batch_size (`int`, defaults to 1):
+                The number of calibration samples to load per batch. Not always used.
+            data_collator (`DataCollator`, *optional*):
+                The function to use to form a batch from a list of elements of the calibration dataset. Not always used.
+            remove_unused_columns (`bool`, defaults to `False`):
+                Whether to remove the columns unused by the model forward method. Not always used.
+        Returns:
+            A calibration dataset as an instance of `CalibrationDataset` containing an `nncf.Dataset` for each model component.
+        """
+        raise NotImplementedError
+
+    def load_dataset(
+        self,
+        dataset_name: str,
+        num_samples: Optional[int] = None,
+        dataset_config_name: Optional[str] = None,
+        dataset_split: str = "train",
+        preprocess_function: Optional[Callable] = None,
+        preprocess_batch: bool = True,
+        token: Optional[Union[bool, str]] = None,
+        cache_dir: str = HUGGINGFACE_HUB_CACHE,
+        streaming: bool = False,
+        **dataset_kwargs,
+    ) -> "Dataset":
+        """
+        Create the calibration `datasets.Dataset` to use for the post-training static quantization calibration step.
+
+        Args:
+            dataset_name (`str`):
+                The dataset repository name on the Hugging Face Hub or path to a local directory containing data files
+                in generic formats and optionally a dataset script, if it requires some code to read the data files.
+            num_samples (`int`, *optional*):
+                The maximum number of samples composing the calibration dataset.
+            dataset_config_name (`str`, *optional*):
+                The name of the dataset configuration.
+            dataset_split (`str`, defaults to `"train"`):
+                Which split of the dataset to use to perform the calibration step.
+            preprocess_function (`Callable`, *optional*):
+                Processing function to apply to each example after loading dataset.
+            preprocess_batch (`bool`, defaults to `True`):
+                Whether the `preprocess_function` should be batched.
+            token (Optional[Union[bool, str]], defaults to `None`):
+                The token to use as HTTP bearer authorization for remote files. If `True`, will use the token generated
+                when running `huggingface-cli login` (stored in `~/.huggingface`).
+            cache_dir (`str`, *optional*):
+                Caching directory for a calibration dataset.
+            streaming (`bool`, defaults to `False`):
+                Whether to load dataset in streaming mode.
+        Returns:
+            The calibration `datasets.Dataset` to use for the post-training static quantization calibration step.
+        """
+        if not is_datasets_available():
+            raise ValueError(DATASETS_IMPORT_ERROR.format("OVCalibrationDatasetBuilder.load_dataset"))
+
+        from datasets import load_dataset
+
+        datasets_kwargs = {
+            **dataset_kwargs,
+            "name": dataset_config_name,
+            "split": dataset_split,
+            "token": token,
+            "cache_dir": cache_dir,
+            "streaming": streaming,
+        }
+
+        dataset = load_dataset(dataset_name, **datasets_kwargs)
+        dataset = dataset.shuffle(seed=self.seed)
+        if num_samples is not None:
+            dataset = dataset.take(num_samples)
+
+        if preprocess_function is not None:
+            dataset = dataset.map(preprocess_function, batched=preprocess_batch)
+
+        return dataset
+
+    def _get_calibration_dataloader(
+        self,
+        dataset: Union["Dataset", List],
+        batch_size: Optional[int] = 1,
+        data_collator: Optional[DataCollator] = None,
+        remove_unused_columns: bool = False,
+    ) -> DataLoader:
+        """
+        Wrap dataset into a dataloader.
+        """
+        if remove_unused_columns:
+            logger.warning("`remove_unused_columns` is deprecated and will be removed in optimum-intel v1.25.")
+
+        if not is_datasets_available():
+            raise ValueError(DATASETS_IMPORT_ERROR.format("CalibrationDatasetBuilder._get_calibration_dataloader"))
+
+        from datasets import Dataset, IterableDataset
+
+        data_collator = data_collator or default_data_collator
+
+        if remove_unused_columns and isinstance(dataset, Dataset):
+            dataset = self._remove_unused_columns(dataset)
+        sampler = None
+        if not isinstance(dataset, IterableDataset):
+            generator = torch.Generator()
+            generator.manual_seed(self.seed)
+            sampler = RandomSampler(dataset, generator=generator)
+
+        dataloader = DataLoader(
+            dataset, batch_size=batch_size, sampler=sampler, collate_fn=data_collator, drop_last=False
+        )
+        return dataloader
+
+    def _remove_unused_columns(self, dataset: "Dataset"):
+        # TODO: deprecate because model.forward() may not be the method which is called during inference,
+        #  for example there is model.generate()
+        ignored_columns = list(set(dataset.column_names) - set(self._signature_columns))
+        return dataset.remove_columns(ignored_columns)
+
+class OVCalibrationDatasetBuilder(CalibrationDatasetBuilder):
+    def build_from_quantization_config(self, config: OVQuantizationConfigBase) -> CalibrationDataset:
+        """
+        Builds a calibration dataset from a quantization config object. Namely, `quantization_config.dataset` property
+        is used to infer dataset name.
+
+        Args:
+            config (`OVQuantizationConfigBase`):
+                The quantization configuration object.
+        Returns:
+            A calibration dataset as an instance of `CalibrationDataset` containing an `nncf.Dataset` for each model component.
         """
         from optimum.intel import (
             OVModelForCausalLM,
@@ -377,77 +593,6 @@ class OVCalibrationDatasetBuilder:
         else:
             raise RuntimeError("Unsupported model type for calibration dataset collection.")
 
-    def build_from_dataset_name(
-        self,
-        quantization_config: OVQuantizationConfigBase,
-        dataset_name: str,
-        num_samples: Optional[int] = None,
-        dataset_config_name: Optional[str] = None,
-        dataset_split: str = "train",
-        preprocess_function: Optional[Callable] = None,
-        preprocess_batch: bool = True,
-        token: Optional[Union[bool, str]] = None,
-        cache_dir: str = HUGGINGFACE_HUB_CACHE,
-        streaming: bool = False,
-        batch_size: Optional[int] = 1,
-        data_collator: Optional[DataCollator] = None,
-        remove_unused_columns: bool = False,
-        **dataset_kwargs,
-    ) -> OVCalibrationDataset:
-        """
-        Create the calibration `datasets.Dataset` to use for the post-training static quantization calibration step.
-
-        Args:
-            quantization_config (`OVQuantizationConfigBase`):
-                The quantization configuration object.
-            dataset_name (`str`):
-                The dataset repository name on the Hugging Face Hub or path to a local directory containing data files
-                in generic formats and optionally a dataset script, if it requires some code to read the data files.
-            dataset_config_name (`str`, *optional*):
-                The name of the dataset configuration.
-            num_samples (`int`, *optional*):
-                The maximum number of samples composing the calibration dataset.
-            dataset_split (`str`, defaults to `"train"`):
-                Which split of the dataset to use to perform the calibration step.
-            preprocess_function (`Callable`, *optional*):
-                Processing function to apply to each example after loading dataset.
-            preprocess_batch (`bool`, defaults to `True`):
-                Whether the `preprocess_function` should be batched.
-            token (Optional[Union[bool, str]], defaults to `None`):
-                The token to use as HTTP bearer authorization for remote files. If `True`, will use the token generated
-                when running `huggingface-cli login` (stored in `~/.huggingface`).
-            cache_dir (`str`, *optional*):
-                Caching directory for a calibration dataset.
-            streaming (`bool`, defaults to `False`):
-                Whether to load dataset in streaming mode.
-            batch_size (`int`, defaults to 1):
-                The number of calibration samples to load per batch.
-            data_collator (`DataCollator`, *optional*):
-                The function to use to form a batch from a list of elements of the calibration dataset.
-            remove_unused_columns (`bool`, defaults to `False`):
-                Whether to remove the columns unused by the model forward method.
-        Returns:
-            A calibration dataset as an instance of `OVCalibrationDataset` containing an `nncf.Dataset` for each model component.
-        """
-
-        if remove_unused_columns:
-            logger.warning("`remove_unused_columns` is deprecated and will be removed in optimum-intel v1.25.")
-
-        dataset = self.load_dataset(
-            dataset_name,
-            num_samples,
-            dataset_config_name,
-            dataset_split,
-            preprocess_function,
-            preprocess_batch,
-            token,
-            cache_dir,
-            streaming,
-            **dataset_kwargs,
-        )
-
-        return self.build_from_dataset(quantization_config, dataset, batch_size, data_collator, remove_unused_columns)
-
     def build_from_dataset(
         self,
         quantization_config: OVQuantizationConfigBase,
@@ -455,7 +600,7 @@ class OVCalibrationDatasetBuilder:
         batch_size: Optional[int] = 1,
         data_collator: Optional[DataCollator] = None,
         remove_unused_columns: bool = False,
-    ) -> OVCalibrationDataset:
+    ) -> CalibrationDataset:
         """
 
         Args:
@@ -470,7 +615,7 @@ class OVCalibrationDatasetBuilder:
             remove_unused_columns (`bool`, defaults to `False`):
                 Whether to remove the columns unused by the model forward method. Not always used.
         Returns:
-            A calibration dataset as an instance of `OVCalibrationDataset` containing an `nncf.Dataset` for each model component.
+            A calibration dataset as an instance of `CalibrationDataset` containing an `nncf.Dataset` for each model component.
         """
         from optimum.intel import (
             OVModelForFeatureExtraction,
@@ -538,108 +683,11 @@ class OVCalibrationDatasetBuilder:
                 return self._prepare_decoder_calibration_data(quantization_config, dataloader)
             else:
                 # Assuming this is the torch model quantization scenario
-                return OVCalibrationDataset({"model": nncf.Dataset(dataloader)})
-
-    def load_dataset(
-        self,
-        dataset_name: str,
-        num_samples: Optional[int] = None,
-        dataset_config_name: Optional[str] = None,
-        dataset_split: str = "train",
-        preprocess_function: Optional[Callable] = None,
-        preprocess_batch: bool = True,
-        token: Optional[Union[bool, str]] = None,
-        cache_dir: str = HUGGINGFACE_HUB_CACHE,
-        streaming: bool = False,
-        **dataset_kwargs,
-    ) -> "Dataset":
-        """
-        Create the calibration `datasets.Dataset` to use for the post-training static quantization calibration step.
-
-        Args:
-            dataset_name (`str`):
-                The dataset repository name on the Hugging Face Hub or path to a local directory containing data files
-                in generic formats and optionally a dataset script, if it requires some code to read the data files.
-            num_samples (`int`, *optional*):
-                The maximum number of samples composing the calibration dataset.
-            dataset_config_name (`str`, *optional*):
-                The name of the dataset configuration.
-            dataset_split (`str`, defaults to `"train"`):
-                Which split of the dataset to use to perform the calibration step.
-            preprocess_function (`Callable`, *optional*):
-                Processing function to apply to each example after loading dataset.
-            preprocess_batch (`bool`, defaults to `True`):
-                Whether the `preprocess_function` should be batched.
-            token (Optional[Union[bool, str]], defaults to `None`):
-                The token to use as HTTP bearer authorization for remote files. If `True`, will use the token generated
-                when running `huggingface-cli login` (stored in `~/.huggingface`).
-            cache_dir (`str`, *optional*):
-                Caching directory for a calibration dataset.
-            streaming (`bool`, defaults to `False`):
-                Whether to load dataset in streaming mode.
-        Returns:
-            The calibration `datasets.Dataset` to use for the post-training static quantization calibration step.
-        """
-        if not is_datasets_available():
-            raise ValueError(DATASETS_IMPORT_ERROR.format("OVCalibrationDatasetBuilder.load_dataset"))
-
-        from datasets import load_dataset
-
-        datasets_kwargs = {
-            **dataset_kwargs,
-            "name": dataset_config_name,
-            "split": dataset_split,
-            "token": token,
-            "cache_dir": cache_dir,
-            "streaming": streaming,
-        }
-
-        dataset = load_dataset(dataset_name, **datasets_kwargs)
-        dataset = dataset.shuffle(seed=self.seed)
-        if num_samples is not None:
-            dataset = dataset.take(num_samples)
-
-        if preprocess_function is not None:
-            dataset = dataset.map(preprocess_function, batched=preprocess_batch)
-
-        return dataset
-
-    def _get_calibration_dataloader(
-        self,
-        dataset: Union["Dataset", List],
-        batch_size: Optional[int] = 1,
-        data_collator: Optional[DataCollator] = None,
-        remove_unused_columns: bool = False,
-    ) -> OVDataLoader:
-        """
-        Wrap dataset into a dataloader.
-        """
-        if remove_unused_columns:
-            logger.warning("`remove_unused_columns` is deprecated and will be removed in optimum-intel v1.25.")
-
-        if not is_datasets_available():
-            raise ValueError(DATASETS_IMPORT_ERROR.format("OVCalibrationDatasetBuilder._get_calibration_dataloader"))
-
-        from datasets import Dataset, IterableDataset
-
-        data_collator = data_collator or default_data_collator
-
-        if remove_unused_columns and isinstance(dataset, Dataset):
-            dataset = self._remove_unused_columns(dataset)
-        sampler = None
-        if not isinstance(dataset, IterableDataset):
-            generator = torch.Generator()
-            generator.manual_seed(self.seed)
-            sampler = RandomSampler(dataset, generator=generator)
-
-        dataloader = DataLoader(
-            dataset, batch_size=batch_size, sampler=sampler, collate_fn=data_collator, drop_last=False
-        )
-        return OVDataLoader(dataloader)
+                return CalibrationDataset({"model": nncf.Dataset(dataloader)})
 
     def _prepare_decoder_calibration_data(
-        self, quantization_config: OVQuantizationConfigBase, dataloader: OVDataLoader
-    ) -> OVCalibrationDataset:
+        self, quantization_config: OVQuantizationConfigBase, dataloader: DataLoader
+    ) -> CalibrationDataset:
         """
         Prepares calibration data by collecting model inputs during inference.
         """
@@ -658,14 +706,15 @@ class OVCalibrationDatasetBuilder:
         finally:
             self.model.request = self.model.request.request
 
-        return OVCalibrationDataset(nncf.Dataset(collected_inputs))
+        return CalibrationDataset(nncf.Dataset(collected_inputs))
 
     def _prepare_causal_lm_calibration_data(
         self, config: OVQuantizationConfigBase, seqlen: int = 32
-    ) -> OVCalibrationDataset:
+    ) -> CalibrationDataset:
         """
         Prepares calibration data for causal language models. Relies on `optimum.gptq.data` module.
         """
+        from optimum.intel.openvino import OVModelForCausalLM
         from optimum.gptq.data import get_dataset, prepare_dataset
 
         tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=config.trust_remote_code)
@@ -682,15 +731,15 @@ class OVCalibrationDatasetBuilder:
             raise ValueError("Please provide dataset as one of the accepted dataset labels or as a list of strings.")
         calibration_dataset = prepare_dataset(calibration_dataset)
         calibration_dataset = nncf.Dataset(calibration_dataset, lambda x: self.model.prepare_inputs(**x))
+        return CalibrationDataset(calibration_dataset)
 
-        return OVCalibrationDataset(calibration_dataset)
 
     def _prepare_visual_causal_lm_calibration_data(
         self,
         config: OVQuantizationConfigBase,
         dataset: "Dataset",
         max_image_size: Optional[int] = 600,
-    ) -> OVCalibrationDataset:
+    ) -> CalibrationDataset:
         """
         Prepares calibration data for VLM pipelines.
         Currently, collects data only for a language model component.
@@ -740,11 +789,11 @@ class OVCalibrationDatasetBuilder:
 
             calibration_data.append(language_model_inputs)
 
-        return OVCalibrationDataset({"lm_model": nncf.Dataset(calibration_data)})
+        return CalibrationDataset({"lm_model": nncf.Dataset(calibration_data)})
 
     def _prepare_speech_to_text_calibration_data(
         self, config: OVQuantizationConfigBase, dataset: "Dataset"
-    ) -> OVCalibrationDataset:
+    ) -> CalibrationDataset:
         """
         Prepares calibration data for speech-to-text pipelines by inferring it on a dataset and collecting incurred inputs.
         """
@@ -779,14 +828,14 @@ class OVCalibrationDatasetBuilder:
         for model_name in collected_inputs:
             collected_inputs[model_name] = nncf.Dataset(collected_inputs[model_name])
 
-        return OVCalibrationDataset(collected_inputs)
+        return CalibrationDataset(collected_inputs)
 
     def _prepare_text_to_text_calibration_data(
         self,
         config: OVQuantizationConfigBase,
         dataset: "Dataset",
         seq_len: int = 128,
-    ) -> OVCalibrationDataset:
+    ) -> CalibrationDataset:
         """
         Prepares calibration data for text-to-text pipelines by inferring it on a dataset and collecting incurred inputs.
         """
@@ -829,11 +878,11 @@ class OVCalibrationDatasetBuilder:
         for model_name in collected_inputs:
             collected_inputs[model_name] = nncf.Dataset(collected_inputs[model_name])
 
-        return OVCalibrationDataset(collected_inputs)
+        return CalibrationDataset(collected_inputs)
 
     def _prepare_diffusion_calibration_data(
         self, config: OVQuantizationConfigBase, dataset: Union[List, "Dataset"]
-    ) -> OVCalibrationDataset:
+    ) -> CalibrationDataset:
         """
         Prepares calibration data for diffusion models by inferring it on a dataset. Currently, collects data only for
         a vision diffusion component.
@@ -868,7 +917,7 @@ class OVCalibrationDatasetBuilder:
             diffuser.request = diffuser.request.request
             self.disable_progress_bar(disable=False)
 
-        return OVCalibrationDataset({diffuser_model_name: nncf.Dataset(calibration_data[:num_samples])})
+        return CalibrationDataset({diffuser_model_name: nncf.Dataset(calibration_data[:num_samples])})
 
     def _remove_unused_columns(self, dataset: "Dataset"):
         # TODO: deprecate because model.forward() may not be the method which is called during inference,
@@ -887,7 +936,7 @@ class OVCalibrationDatasetBuilder:
         quantization_config: OVQuantizationConfigBase,
         dataset: "Dataset",
         seq_len: int = 128,
-    ) -> OVCalibrationDataset:
+    ) -> CalibrationDataset:
         """
         Prepares calibration data for text-encoder-like models.
         Supports OVModelForFeatureExtraction, OVModelForMaskedLM and OVSentenceTransformer.
@@ -963,14 +1012,14 @@ class OVCalibrationDatasetBuilder:
         finally:
             self.model.request = self.model.request.request
 
-        return OVCalibrationDataset({"model": nncf.Dataset(calibration_data)})
+        return CalibrationDataset({"model": nncf.Dataset(calibration_data)})
 
     def _prepare_text_image_encoder_model_calibration_data(
         self,
         quantization_config: OVQuantizationConfigBase,
         dataset: "Dataset",
         seq_len: int = 128,
-    ) -> OVCalibrationDataset:
+    ) -> CalibrationDataset:
         self.model.compile()
 
         def get_processor():
@@ -1031,9 +1080,9 @@ class OVCalibrationDatasetBuilder:
         finally:
             self.model.request = self.model.request.request
 
-        return OVCalibrationDataset({"model": nncf.Dataset(calibration_data)})
+        return CalibrationDataset({"model": nncf.Dataset(calibration_data)})
 
-    def _prepare_sam_dataset(self, config: OVQuantizationConfigBase, dataset: "Dataset") -> OVCalibrationDataset:
+    def _prepare_sam_dataset(self, config: OVQuantizationConfigBase, dataset: "Dataset") -> CalibrationDataset:
         from optimum.intel.openvino.modeling_sam import OVSamPromptEncoder, OVSamVisionEncoder
 
         models: Dict[str, Union[OVSamVisionEncoder, OVSamPromptEncoder]] = {}
@@ -1072,7 +1121,7 @@ class OVCalibrationDatasetBuilder:
         for model_name in collected_inputs:
             collected_inputs[model_name] = nncf.Dataset(collected_inputs[model_name])
 
-        return OVCalibrationDataset(collected_inputs)
+        return CalibrationDataset(collected_inputs)
 
     @staticmethod
     def _wrap_sample_as_array(
@@ -1088,6 +1137,223 @@ class OVCalibrationDatasetBuilder:
                 v_as_array = v_as_array[None]
             results[k] = v_as_array
         return results
+
+
+class ORTCalibrationDatasetBuilder(CalibrationDatasetBuilder):
+    def build_from_quantization_config(self, config: OVQuantizationConfigBase) -> CalibrationDataset:
+        """
+        Builds a calibration dataset from a quantization config object. Namely, `quantization_config.dataset` property
+        is used to infer dataset name.
+
+        Args:
+            config (`OVQuantizationConfigBase`):
+                The quantization configuration object.
+        Returns:
+            A calibration dataset as an instance of `CalibrationDataset` containing an `nncf.Dataset` for each model component.
+        """
+
+        from optimum.onnxruntime import ORTModelForCausalLM, ORTModelForVision2Seq
+        from optimum.onnxruntime.modeling_seq2seq import _ORTModelForWhisper
+
+        if config.dataset is None:
+            raise ValueError("Please provide a dataset for calibration.")
+
+        if isinstance(self.model, ORTModelForCausalLM):
+            if config.tokenizer is None:
+                raise ValueError("Please provide a tokenizer via `quantization_config.tokenizer` property.")
+            return self._prepare_causal_lm_calibration_data(config)
+        elif isinstance(
+            self.model,
+            (_ORTModelForWhisper, ORTModelForVision2Seq),
+        ):
+            if config.processor is None:
+                raise ValueError(
+                    "`processor` must be specified in order to run data-aware quantization. Please provide it as a"
+                    "model id, or a path to a directory containing all the required configuration files."
+                )
+
+            if isinstance(self.model, ORTModelForVision2Seq):
+                dataset_metadata = PREDEFINED_VISUAL_LM_DATASETS[config.dataset]
+                return self.build_from_dataset_name(
+                    config,
+                    dataset_metadata["id"],
+                    num_samples=config.num_samples,
+                    dataset_split=dataset_metadata["split"],
+                )
+            elif isinstance(self.model, _ORTModelForWhisper):
+                dataset_metadata = PREDEFINED_SPEECH_TO_TEXT_DATASETS[config.dataset]
+                return self.build_from_dataset_name(
+                    config,
+                    dataset_metadata["id"],
+                    num_samples=config.num_samples,  # This is an upper bound on how many audios are needed
+                    dataset_split=dataset_metadata["split"],
+                    streaming=dataset_metadata["streaming"],
+                    data_dir=dataset_metadata.get("data_dir", None),
+                    revision=dataset_metadata.get("revision", None),
+                )
+            else:
+                raise Exception()
+        else:
+            raise RuntimeError("Unsupported model type for calibration dataset collection.")
+
+    def build_from_dataset(
+        self,
+        quantization_config: OVQuantizationConfigBase,
+        dataset: Union["Dataset", List],
+        batch_size: Optional[int] = 1,
+        data_collator: Optional[DataCollator] = None,
+        remove_unused_columns: bool = False,
+    ) -> CalibrationDataset:
+        from optimum.onnxruntime import ORTModelForVision2Seq
+        from optimum.onnxruntime.modeling_seq2seq import _ORTModelForWhisper
+
+        if isinstance(self.model, ORTModelForVision2Seq):
+            return self._prepare_visual_causal_lm_calibration_data(quantization_config, dataset)
+        elif isinstance(self.model, _ORTModelForWhisper):
+            return self._prepare_speech_to_text_calibration_data(quantization_config, dataset)
+        else:
+            raise RuntimeError("Unsupported model type for calibration dataset collection.")
+
+    def _prepare_causal_lm_calibration_data(
+        self, config: OVQuantizationConfigBase, seqlen: int = 32
+    ) -> CalibrationDataset:
+        from optimum.gptq.data import get_dataset, prepare_dataset
+
+        tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=config.trust_remote_code)
+        nsamples = config.num_samples if config.num_samples else 128
+        if isinstance(config.dataset, str):
+            if config.dataset == "auto":
+                generated_data = nncf.data.generate_text_data(self.model, tokenizer, dataset_size=nsamples)
+                calibration_dataset = [tokenizer(text, return_tensors="pt") for text in generated_data]
+            else:
+                calibration_dataset = get_dataset(config.dataset, tokenizer, seqlen=seqlen, nsamples=nsamples)
+        elif isinstance(config.dataset, list) and all(isinstance(it, str) for it in config.dataset):
+            calibration_dataset = [tokenizer(text, return_tensors="pt") for text in config.dataset[:nsamples]]
+        else:
+            raise ValueError("Please provide dataset as one of the accepted dataset labels or as a list of strings.")
+        calibration_dataset = prepare_dataset(calibration_dataset)
+
+        collected_inputs = []
+        self.model.session = ORTSessionWrapper(self.model.session, collected_inputs)
+        try:
+            for data in tqdm(calibration_dataset, desc="Collecting calibration data", total=nsamples):
+                self.model.generate(**data, max_new_tokens=1)
+        finally:
+            self.model.session = self.model.session.session
+
+        calibration_dataset = nncf.Dataset(collected_inputs)
+        return CalibrationDataset(calibration_dataset)
+
+    def _prepare_visual_causal_lm_calibration_data(
+        self,
+        config: OVQuantizationConfigBase,
+        dataset: "Dataset",
+        max_image_size: Optional[int] = 600,
+    ) -> CalibrationDataset:
+        """
+        Prepares calibration data for VLM pipelines.
+        Currently, collects data only for a language model component.
+        """
+
+        from optimum.onnxruntime.modeling_seq2seq import ORTEncoder, ORTDecoderForSeq2Seq
+
+        submodels: Dict[str, Union[ORTEncoder, ORTDecoderForSeq2Seq]] = {}
+        collected_inputs: Dict[str, List[Dict[str, Any]]] = {}
+        submodel_names = ["encoder", "decoder"]
+        if self.model.use_cache and not self.model.use_merged:
+           submodel_names.append("decoder_with_past") 
+        for submodel_name in submodel_names:
+            submodel: Union[ORTEncoder, ORTDecoderForSeq2Seq] = getattr(self.model, submodel_name)
+            submodels[submodel_name] = submodel
+            collected_inputs[submodel_name] = []
+            submodel.session = InferRequestWrapper(submodel.session, collected_inputs[submodel_name])
+        
+        processor = AutoProcessor.from_pretrained(config.processor, trust_remote_code=config.trust_remote_code)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=config.trust_remote_code)
+            tokenizer_error = None
+        except Exception as tokenizer_error:  # noqa: F841
+            tokenizer = None
+
+        try:
+            dataset_metadata = PREDEFINED_VISUAL_LM_DATASETS[config.dataset]
+    
+            calibration_data = []
+            num_samples = config.num_samples or 32
+            for item in tqdm(dataset, desc="Collecting calibration dataset", total=num_samples):
+                if len(calibration_data) > num_samples:
+                    break
+    
+                instruction = item[dataset_metadata["inputs"]["instruction"]]
+                image_url = item[dataset_metadata["inputs"]["image_url"]]
+                image = Image.open(requests.get(image_url, stream=True).raw).convert("RGB")
+                if max_image_size is not None:
+                    # To avoid large images, resize them keeping the aspect ratio
+                    scale_factor = max(image.size[0] / max_image_size, image.size[1] / max_image_size)
+                    if scale_factor > 1:
+                        new_size = (int(image.size[0] / scale_factor), int(image.size[1] / scale_factor))
+                        image = image.resize(new_size)
+    
+                try:
+                    inputs = self.model.preprocess_inputs(
+                        text=instruction, image=image, processor=processor, tokenizer=tokenizer, config=self.model.config
+                    )
+                except ValueError as value_error:
+                    if "Tokenizer is required." in str(value_error) and tokenizer_error is not None:
+                        raise tokenizer_error
+                    raise value_error
+    
+                self.model.forward(**inputs)
+        finally:
+            for model in submodels.values():
+                model.session = model.session.session
+
+        for submodel_name in collected_inputs:
+            collected_inputs[submodel_name] = nncf.Dataset(collected_inputs[submodel_name])
+
+        return CalibrationDataset(collected_inputs)
+
+    def _prepare_speech_to_text_calibration_data(
+        self, config: OVQuantizationConfigBase, dataset: "Dataset"
+    ) -> CalibrationDataset:
+        """
+        Prepares calibration data for speech-to-text pipelines by inferring it on a dataset and collecting incurred inputs.
+        """
+
+        from optimum.onnxruntime.modeling_seq2seq import ORTEncoder, ORTDecoderForSeq2Seq
+
+        submodels: Dict[str, Union[ORTEncoder, ORTDecoderForSeq2Seq]] = {}
+        collected_inputs: Dict[str, List[Dict[str, Any]]] = {}
+        submodel_names = ["encoder", "decoder"]
+        if self.model.use_cache and not self.model.use_merged:
+           submodel_names.append("decoder_with_past") 
+        for submodel_name in submodel_names:
+            submodel: Union[ORTEncoder, ORTDecoderForSeq2Seq] = getattr(self.model, submodel_name)
+            submodels[submodel_name] = submodel
+            collected_inputs[submodel_name] = []
+            submodel.session = InferRequestWrapper(submodel.session, collected_inputs[submodel_name])
+            
+        try:
+            processor = AutoProcessor.from_pretrained(config.processor, trust_remote_code=config.trust_remote_code)
+
+            # Download audio inputs beforehand to avoid possible connection issues
+            num_samples = config.num_samples or 32
+            dataset = list(tqdm(dataset.take(num_samples), desc="Downloading audio inputs", total=num_samples))
+
+            for item in tqdm(dataset, desc="Collecting calibration data"):
+                audio = item["audio"]["array"]
+                sampling_rate = item["audio"]["sampling_rate"]
+                input_features = processor(audio, sampling_rate=sampling_rate, return_tensors="pt").input_features
+                self.model.generate(input_features)
+        finally:
+            for model in submodels.values():
+                model.session = model.session.session
+
+        for submodel_name in collected_inputs:
+            collected_inputs[submodel_name] = nncf.Dataset(collected_inputs[submodel_name])
+
+        return CalibrationDataset(collected_inputs)
+
 
 
 class OVQuantizer(OptimumQuantizer):
@@ -1106,9 +1372,17 @@ class OVQuantizer(OptimumQuantizer):
                 The random seed to use when shuffling the calibration dataset.
         """
         super().__init__()
+
+        from optimum.intel.openvino.modeling_base import OVBaseModel
+
         self.model = model
         self.task = task
-        self.dataset_builder = OVCalibrationDatasetBuilder(model, seed)
+        if isinstance(self.model, OVBaseModel):
+            self.dataset_builder = OVCalibrationDatasetBuilder(model, seed)
+        elif isinstance(self.model, ORTModel):
+            self.dataset_builder = ORTCalibrationDatasetBuilder(model, seed)
+        else:
+            raise RuntimeError("Unsupported model type for calibration dataset collection.")
 
     @classmethod
     def from_pretrained(cls, model: PreTrainedModel, **kwargs):
@@ -1118,7 +1392,7 @@ class OVQuantizer(OptimumQuantizer):
     def quantize(
         self,
         calibration_dataset: Optional[
-            Union[OVCalibrationDataset, "Dataset", nncf.Dataset, Union[str, nncf.Dataset], List]
+            Union[CalibrationDataset, "Dataset", nncf.Dataset, Union[str, nncf.Dataset], List]
         ] = None,
         save_directory: Optional[Union[str, Path]] = None,
         ov_config: OVConfig = None,
@@ -1182,7 +1456,7 @@ class OVQuantizer(OptimumQuantizer):
             )
 
         if calibration_dataset is not None and isinstance(calibration_dataset, (dict, nncf.Dataset)):
-            calibration_dataset = OVCalibrationDataset(calibration_dataset)
+            calibration_dataset = CalibrationDataset(calibration_dataset)
 
         if ov_config is None:
             ov_config = OVConfig()
@@ -1209,7 +1483,7 @@ class OVQuantizer(OptimumQuantizer):
         if is_diffusers_available():
             from optimum.intel.openvino.modeling_diffusion import OVDiffusionPipeline
 
-        if calibration_dataset is not None and not isinstance(calibration_dataset, OVCalibrationDataset):
+        if calibration_dataset is not None and not isinstance(calibration_dataset, CalibrationDataset):
             # Process custom calibration dataset
             if (
                 is_diffusers_available()
@@ -1261,7 +1535,6 @@ class OVQuantizer(OptimumQuantizer):
                 calibration_dataset,
                 **kwargs,
             )
-
         elif isinstance(self.model, torch.nn.Module):
             logger.warning(
                 "The support of `torch.nn.Module` will be deprecated in a future release of optimum-intel, please use the corresponding `OVModelForXxx` class to load you model."
@@ -1274,6 +1547,10 @@ class OVQuantizer(OptimumQuantizer):
                 file_name,
                 **kwargs,
             )
+        elif isinstance(self.model, ORTModel):
+            if save_directory is None:
+                raise ValueError("Please provide `save_directory` if `ORTModel` is used.")
+            self._quantize_onnx_model(ov_config, save_directory, calibration_dataset, **kwargs)
         else:
             raise TypeError(f"Unsupported model type: {type(self.model)}")
 
@@ -1281,112 +1558,16 @@ class OVQuantizer(OptimumQuantizer):
         self,
         ov_config: OVConfig,
         save_directory: Union[str, Path] = None,
-        calibration_dataset: Optional[OVCalibrationDataset] = None,
+        calibration_dataset: Optional[CalibrationDataset] = None,
         **kwargs,
     ):
-        from optimum.intel.openvino.modeling_seq2seq import _OVModelForWhisper
-        from optimum.intel.openvino.modeling_visual_language import OVModelForVisualCausalLM
-
-        if is_diffusers_available():
-            from optimum.intel.openvino.modeling_diffusion import OVDiffusionPipeline
-
         quantization_config = ov_config.quantization_config
         if calibration_dataset is None and quantization_config.dataset is not None:
             calibration_dataset = self.dataset_builder.build_from_quantization_config(quantization_config)
 
-        quantization_configs = {}
-        if isinstance(quantization_config, OVPipelineQuantizationConfig):
-            quantization_configs = quantization_config.quantization_configs
-        elif (
-            isinstance(quantization_config, OVWeightQuantizationConfig)
-            and quantization_config.quant_method != OVQuantizationMethod.HYBRID
-        ):
-            #
-            # Regular (non-hybrid) weight-only quantization
-            #
-            if isinstance(self.model, OVModelForVisualCausalLM):
-                for submodel_name in self.model.ov_submodels:
-                    quantization_configs[submodel_name] = (
-                        quantization_config
-                        if submodel_name == "lm_model"
-                        else OVWeightQuantizationConfig(bits=8, sym=True)
-                    )
-            else:
-                for submodel_name in self.model.ov_submodels:
-                    quantization_configs[submodel_name] = quantization_config
-        else:
-            #
-            # Hybrid/Full/Mixed quantization
-            #
-
-            if calibration_dataset is None:
-                raise ValueError("Calibration dataset is required to run data-aware quantization.")
-
-            if (
-                isinstance(quantization_config, OVWeightQuantizationConfig)
-                and quantization_config.quant_method == OVQuantizationMethod.HYBRID
-            ):
-                #
-                # Hybrid quantization
-                #
-                if is_diffusers_available() and isinstance(self.model, OVDiffusionPipeline):
-                    if len(calibration_dataset) > 1:
-                        raise ValueError("Calibration datasets for Diffusion models should contain only one value.")
-
-                    # Apply hybrid quantization to diffusion model
-                    diffusion_model_name = next(iter(calibration_dataset))
-                    diffusion_model = getattr(self.model, diffusion_model_name).model
-                    quantization_configs[diffusion_model_name] = _get_hybrid_mixed_quantization_config(
-                        diffusion_model, quantization_config, **kwargs
-                    )
-
-                    # Apply weight-only quantization to all SD submodels except UNet/Transformer
-                    quantization_config_copy = quantization_config.clone()
-                    quantization_config_copy.dataset = None
-                    quantization_config_copy.quant_method = OVQuantizationMethod.DEFAULT
-                    for submodel_name in self.model.ov_submodels:
-                        if submodel_name != diffusion_model_name:
-                            quantization_configs[submodel_name] = quantization_config_copy
-                else:
-                    # The model may be for example OVModelForImageClassification, OVModelForAudioClassification, etc.
-                    quantization_configs["model"] = quantization_config
-            elif isinstance(quantization_config, OVQuantizationConfig):
-                #
-                # Full quantization
-                #
-                if isinstance(self.model, _OVModelForWhisper):
-                    for submodel_name in self.model.ov_submodels:
-                        # quantization_config.num_samples of audio samples result in more actual model inputs
-                        config = quantization_config.clone()
-                        config.num_samples = calibration_dataset[submodel_name].get_length()
-                        quantization_configs[submodel_name] = config
-                elif is_diffusers_available() and isinstance(self.model, OVDiffusionPipeline):
-                    diffusion_model_name = next(iter(calibration_dataset))
-                    quantization_configs[diffusion_model_name] = quantization_config
-                    for submodel_name in self.model.ov_submodels:
-                        if submodel_name != diffusion_model_name:
-                            quantization_configs[submodel_name] = OVWeightQuantizationConfig(bits=8)
-                elif isinstance(self.model, OVModelForVisualCausalLM):
-                    for submodel_name in self.model.ov_submodels:
-                        quantization_configs[submodel_name] = (
-                            quantization_config
-                            if submodel_name == "lm_model"
-                            else OVWeightQuantizationConfig(bits=8, sym=True)
-                        )
-                else:
-                    for submodel_name in self.model.ov_submodels:
-                        quantization_configs[submodel_name] = quantization_config
-            elif isinstance(quantization_config, OVMixedQuantizationConfig):
-                #
-                # Mixed quantization
-                #
-                if is_diffusers_available() and isinstance(self.model, OVDiffusionPipeline):
-                    raise NotImplementedError("Mixed precision quantization isn't supported for diffusers.")
-
-                for submodel_name in self.model.ov_submodels:
-                    quantization_configs[submodel_name] = quantization_config
-            else:
-                raise ValueError(f"Unsupported type of quantization config: {type(quantization_config)}")
+        quantization_configs = self._prepare_ov_per_model_quantization_configs(
+            quantization_config, calibration_dataset, **kwargs
+        )
 
         for submodel_name, config in quantization_configs.items():
             if submodel_name not in self.model.ov_submodels:
@@ -1435,7 +1616,7 @@ class OVQuantizer(OptimumQuantizer):
         self,
         ov_config: OVConfig,
         save_directory: Union[str, Path],
-        calibration_datasets: Optional[OVCalibrationDataset] = None,
+        calibration_datasets: Optional[CalibrationDataset] = None,
         file_name: Optional[str] = None,
         **kwargs,
     ):
@@ -1548,6 +1729,301 @@ class OVQuantizer(OptimumQuantizer):
 
         ov_config.save_pretrained(save_directory)
 
+    def _quantize_onnx_model(
+        self,
+        ov_config: OVConfig,
+        save_directory: Union[str, Path],
+        calibration_dataset: Optional[CalibrationDataset] = None,
+        **kwargs,
+    ):
+        from optimum.onnxruntime import ORTModelForCausalLM, ORTModelForVision2Seq
+        from optimum.onnxruntime.modeling_seq2seq import _ORTModelForWhisper
+
+        quantization_config = ov_config.quantization_config
+        if calibration_dataset is None and quantization_config.dataset is not None:
+            calibration_dataset = self.dataset_builder.build_from_quantization_config(quantization_config)
+
+        quantization_configs = self._prepare_ort_per_model_quantization_configs(
+            quantization_config, calibration_dataset, **kwargs
+        )
+
+        if isinstance(self.model, ORTModelForCausalLM):
+            submodel_names = ["model"]
+        elif isinstance(self.model, (ORTModelForVision2Seq, _ORTModelForWhisper)):
+            submodel_names = ["encoder", "decoder"]
+            if self.model.use_cache and not self.model.use_merged:
+                submodel_names.append("decoder_with_past")
+        else:
+            raise ValueError(f"Unsupported model: {type(self.model)}")
+
+        self.model.save_pretrained(save_directory)
+
+        for submodel_name, config in quantization_configs.items():
+            if submodel_name not in submodel_names:
+                raise RuntimeError(
+                    f"Unexpected submodel name encountered during applying quantization: {submodel_name}. "
+                    f"Available submodels: {list(self.model.ov_submodels.keys())}."
+                )
+            submodel_filename = f"{submodel_name}_model.onnx" if submodel_name != "model" else "model.onnx"
+            submodel = onnx.load(f"{save_directory}/{submodel_filename}", load_external_data=False)
+            nncf_dataset = calibration_dataset.get(submodel_name, None) if calibration_dataset else None
+
+            # if isinstance(config, OVWeightQuantizationConfig) and config.quant_method == OVQuantizationMethod.HYBRID:
+            #     config = _get_hybrid_mixed_quantization_config(submodel, config, **kwargs)
+
+            if isinstance(config, OVWeightQuantizationConfig):
+                kwargs["advanced_parameters"] = nncf.AdvancedCompressionParameters(
+                    backend_params={BackendParameters.EXTERNAL_DATA_DIR: save_directory}
+                )
+                quantized_model = _weight_only_quantization(submodel, config, nncf_dataset, **kwargs)
+            elif isinstance(config, (OVQuantizationConfig, OVMixedQuantizationConfig)):
+                if nncf_dataset is None:
+                    raise ValueError(
+                        f"Calibration dataset for submodel {submodel_name} is required to run quantization."
+                    )
+                if isinstance(config, OVQuantizationConfig):
+                    kwargs["advanced_parameters"] = nncf.AdvancedQuantizationParameters(
+                        backend_params={BackendParameters.EXTERNAL_DATA_DIR: save_directory}
+                    )
+                    quantized_model = _full_quantization(submodel, config, nncf_dataset, **kwargs)
+                else:
+                    # TODO add advanced params
+                    quantized_model = _mixed_quantization(submodel, config, nncf_dataset, **kwargs)
+            else:
+                raise ValueError(f"Unsupported type of quantization config: {type(config)}.")
+
+            # Replace the original model with the quantized model
+            if submodel_name == "model":
+                self.model.model = quantized_model
+            else:
+                getattr(self.model, submodel_name).model = quantized_model
+
+            onnx.save(quantized_model, f"{save_directory}/{submodel_filename}", save_as_external_data=True)
+
+            # TODO: Somehow load quantized components into self.model?
+
+    def _prepare_ov_per_model_quantization_configs(
+        self,
+        quantization_config: OVQuantizationConfigBase,
+        calibration_dataset: Optional[CalibrationDataset] = None,
+        **kwargs,
+    ) -> Dict[str, OVQuantizationConfigBase]:
+        from optimum.intel.openvino.modeling_seq2seq import _OVModelForWhisper
+        from optimum.intel.openvino.modeling_visual_language import OVModelForVisualCausalLM
+
+        if is_diffusers_available():
+            from optimum.intel.openvino.modeling_diffusion import OVDiffusionPipeline
+
+        quantization_configs = {}
+        if isinstance(quantization_config, OVPipelineQuantizationConfig):
+            quantization_configs = quantization_config.quantization_configs
+        elif (
+            isinstance(quantization_config, OVWeightQuantizationConfig)
+            and quantization_config.quant_method != OVQuantizationMethod.HYBRID
+        ):
+            #
+            # Regular (non-hybrid) weight-only quantization
+            #
+            if isinstance(self.model, OVModelForVisualCausalLM):
+                for submodel_name in self.model.ov_submodels:
+                    quantization_configs[submodel_name] = (
+                        quantization_config
+                        if submodel_name == "lm_model"
+                        else OVWeightQuantizationConfig(bits=8, sym=True)
+                    )
+            else:
+                for submodel_name in self.model.ov_submodels:
+                    quantization_configs[submodel_name] = quantization_config
+        else:
+            #
+            # Hybrid/Full/Mixed quantization
+            #
+
+            if calibration_dataset is None:
+                raise ValueError("Calibration dataset is required to run data-aware quantization.")
+
+            if (
+                isinstance(quantization_config, OVWeightQuantizationConfig)
+                and quantization_config.quant_method == OVQuantizationMethod.HYBRID
+            ):
+                #
+                # Hybrid quantization
+                #
+                if is_diffusers_available() and isinstance(self.model, OVDiffusionPipeline):
+                    if len(calibration_dataset) > 1:
+                        raise ValueError("Calibration datasets for Diffusion models should contain only one value.")
+
+                    # Apply hybrid quantization to diffusion model
+                    diffusion_model_name = next(iter(calibration_dataset))
+                    diffusion_model = getattr(self.model, diffusion_model_name).model
+                    quantization_configs[diffusion_model_name] = _get_hybrid_mixed_quantization_config(
+                        diffusion_model, quantization_config, **kwargs
+                    )
+
+                    # Apply weight-only quantization to all SD submodels except UNet/Transformer
+                    quantization_config_copy = quantization_config.clone()
+                    quantization_config_copy.dataset = None
+                    quantization_config_copy.quant_method = OVQuantizationMethod.DEFAULT
+                    for submodel_name in self.model.ov_submodels:
+                        if submodel_name != diffusion_model_name:
+                            quantization_configs[submodel_name] = quantization_config_copy
+                else:
+                    # The model may be for example OVModelForImageClassification, OVModelForAudioClassification, etc.
+                    quantization_configs["model"] = quantization_config
+            elif isinstance(quantization_config, OVQuantizationConfig):
+                #
+                # Full quantization
+                #
+                if isinstance(self.model, _OVModelForWhisper):
+                    for submodel_name in self.model.ov_submodels:
+                        # quantization_config.num_samples of audio samples result in more actual model inputs
+                        config = quantization_config.clone()
+                        config.num_samples = calibration_dataset[submodel_name].get_length()
+                        quantization_configs[submodel_name] = config
+                elif is_diffusers_available() and isinstance(self.model, OVDiffusionPipeline):
+                    diffusion_model_name = next(iter(calibration_dataset))
+                    quantization_configs[diffusion_model_name] = quantization_config
+                    for submodel_name in self.model.ov_submodels:
+                        if submodel_name != diffusion_model_name:
+                            quantization_configs[submodel_name] = OVWeightQuantizationConfig(bits=8)
+                elif isinstance(self.model, OVModelForVisualCausalLM):
+                    for submodel_name in self.model.ov_submodels:
+                        quantization_configs[submodel_name] = (
+                            quantization_config
+                            if submodel_name == "lm_model"
+                            else OVWeightQuantizationConfig(bits=8, sym=True)
+                        )
+                else:
+                    for submodel_name in self.model.ov_submodels:
+                        quantization_configs[submodel_name] = quantization_config
+            elif isinstance(quantization_config, OVMixedQuantizationConfig):
+                #
+                # Mixed quantization
+                #
+                if is_diffusers_available() and isinstance(self.model, OVDiffusionPipeline):
+                    raise NotImplementedError("Mixed precision quantization isn't supported for diffusers.")
+
+                for submodel_name in self.model.ov_submodels:
+                    quantization_configs[submodel_name] = quantization_config
+            else:
+                raise ValueError(f"Unsupported type of quantization config: {type(quantization_config)}")
+
+        return quantization_configs
+
+    def _prepare_ort_per_model_quantization_configs(
+        self,
+        quantization_config: OVQuantizationConfigBase,
+        calibration_dataset: Optional[CalibrationDataset] = None,
+        **kwargs,
+    ) -> Dict[str, OVQuantizationConfigBase]:
+        from optimum.onnxruntime import ORTModelForCausalLM, ORTModelForVision2Seq
+        from optimum.onnxruntime.modeling_seq2seq import _ORTModelForWhisper
+
+        quantization_configs = {}
+        if isinstance(quantization_config, OVPipelineQuantizationConfig):
+            quantization_configs = quantization_config.quantization_configs
+        elif (
+            isinstance(quantization_config, OVWeightQuantizationConfig)
+            and quantization_config.quant_method != OVQuantizationMethod.HYBRID
+        ):
+            #
+            # Regular (non-hybrid) weight-only quantization
+            #
+            if isinstance(self.model, ORTModelForCausalLM):
+                quantization_configs["model"] = quantization_config
+            elif isinstance(self.model, ORTModelForVision2Seq):
+                submodel_names = ["encoder", "decoder"]
+                if self.model.use_cache and not self.model.use_merged:
+                    submodel_names.append("decoder_with_past")
+                for submodel_name in submodel_names:
+                        quantization_configs[submodel_name] = (
+                            quantization_config
+                            if submodel_name.startswith("decoder")
+                            else OVWeightQuantizationConfig(bits=8, sym=True)
+                        )
+            elif isinstance(self.model, _ORTModelForWhisper):
+                submodel_names = ["encoder", "decoder"]
+                if self.model.use_cache and not self.model.use_merged:
+                    submodel_names.append("decoder_with_past")
+                for submodel_name in submodel_names:
+                        quantization_configs[submodel_name] = quantization_config
+            else:
+                raise ValueError(f"Unsupported model type {type(self.model)}")
+        else:
+            #
+            # Hybrid/Full/Mixed quantization
+            #
+
+            if calibration_dataset is None:
+                raise ValueError("Calibration dataset is required to run data-aware quantization.")
+
+            if (
+                isinstance(quantization_config, OVWeightQuantizationConfig)
+                and quantization_config.quant_method == OVQuantizationMethod.HYBRID
+            ):
+                #
+                # Hybrid quantization
+                #
+                raise NotImplementedError()
+            elif isinstance(quantization_config, OVQuantizationConfig):
+                #
+                # Full quantization
+                #
+                if isinstance(self.model, ORTModelForCausalLM):
+                    quantization_configs["model"] = quantization_config
+                elif isinstance(self.model, _ORTModelForWhisper):
+                    submodel_names = ["encoder", "decoder"]
+                    if self.model.use_cache and not self.model.use_merged:
+                        submodel_names.append("decoder_with_past")
+                    for submodel_name in submodel_names:
+                        # quantization_config.num_samples of audio samples result in more actual model inputs
+                        config = quantization_config.clone()
+                        config.num_samples = calibration_dataset[submodel_name].get_length()
+                        quantization_configs[submodel_name] = config
+                elif isinstance(self.model, ORTModelForVision2Seq):
+                    submodel_names = ["encoder", "decoder"]
+                    if self.model.use_cache and not self.model.use_merged:
+                        submodel_names.append("decoder_with_past")
+                    for submodel_name in submodel_names:
+                        quantization_configs[submodel_name] = (
+                            quantization_config
+                            if submodel_name.startswith("decoder")
+                            else OVWeightQuantizationConfig(bits=8, sym=True)
+                        )
+                else:
+                    raise ValueError(f"Unsupported model type {type(self.model)}")
+            elif isinstance(quantization_config, OVMixedQuantizationConfig):
+                #
+                # Mixed quantization
+                #
+                if isinstance(self.model, ORTModelForCausalLM):
+                    quantization_configs["model"] = quantization_config
+                elif isinstance(self.model, _ORTModelForWhisper):
+                    submodel_names = ["encoder", "decoder"]
+                    if self.model.use_cache and not self.model.use_merged:
+                        submodel_names.append("decoder_with_past")
+                    for submodel_name in submodel_names:
+                        # quantization_config.num_samples of audio samples result in more actual model inputs
+                        config = quantization_config.clone()
+                        config.num_samples = calibration_dataset[submodel_name].get_length()
+                        quantization_configs[submodel_name] = config
+                elif isinstance(self.model, ORTModelForVision2Seq):
+                    submodel_names = ["encoder", "decoder"]
+                    if self.model.use_cache and not self.model.use_merged:
+                        submodel_names.append("decoder_with_past")
+                    for submodel_name in submodel_names:
+                        quantization_configs[submodel_name] = (
+                            quantization_config
+                            if submodel_name.startswith("decoder")
+                            else OVWeightQuantizationConfig(bits=8, sym=True)
+                        )
+                else:
+                    raise ValueError(f"Unsupported model type {type(self.model)}")
+            else:
+                raise ValueError(f"Unsupported type of quantization config: {type(quantization_config)}")
+
+        return quantization_configs
+
     @staticmethod
     def _save_pretrained(model: openvino.Model, output_path: str):
         compress_quantize_weights_transformation(model)
@@ -1610,11 +2086,11 @@ class OVQuantizer(OptimumQuantizer):
             The calibration `datasets.Dataset` to use for the post-training static quantization calibration step.
         """
 
-        # TODO: consider in the future for this method to return OVCalibrationDataset instance from either datasets.Dataset instance or its name as input.
-        #  This way OVQuantizer.quantize() will accept fully ready OVCalibrationDataset instance and `batch_size` and `data_collator` arguments can be removed.
+        # TODO: consider in the future for this method to return CalibrationDataset instance from either datasets.Dataset instance or its name as input.
+        #  This way OVQuantizer.quantize() will accept fully ready CalibrationDataset instance and `batch_size` and `data_collator` arguments can be removed.
         #  Example usage in such scenario:
         #  ```
-        #  calibration_dataset: OVCalibrationDataset = ov_quantizer.get_calibration_dataset(ov_config, dataset_name, ..., batch_size, data_collator)
+        #  calibration_dataset: CalibrationDataset = ov_quantizer.get_calibration_dataset(ov_config, dataset_name, ..., batch_size, data_collator)
         #  ov_quantizer.quantize(calibration_dataset, ov_config)
         #  ```
 
@@ -1638,7 +2114,8 @@ def _weight_only_quantization(
     calibration_dataset: Optional[Union[nncf.Dataset, Iterable]] = None,
     **kwargs,
 ) -> openvino.Model:
-    _verify_not_optimized(model)
+    if isinstance(model, openvino.Model):
+        _verify_not_optimized(model)
     config = quantization_config
     if isinstance(config, dict):
         config = OVWeightQuantizationConfig.from_dict(quantization_config)
@@ -1686,8 +2163,9 @@ def _weight_only_quantization(
         **wc_kwargs,
     )
 
-    _remove_f16_kv_cache_precision_flag(compressed_model)
-    _add_nncf_version_flag(compressed_model)
+    if isinstance(model, openvino.Model):
+        _remove_f16_kv_cache_precision_flag(compressed_model)
+        _add_nncf_version_flag(compressed_model)
 
     return compressed_model
 
@@ -1704,7 +2182,7 @@ def _full_quantization(
             f"Expected quantization config to be an instance of `OVQuantizationConfig`, but got {type(quantization_config)}."
         )
 
-    if verify_not_optimized:
+    if isinstance(model, openvino.Model) and verify_not_optimized:
         _verify_not_optimized(model)
 
     q_kwargs = quantization_config.to_nncf_dict()
@@ -1721,8 +2199,9 @@ def _full_quantization(
 
     quantized_model = nncf.quantize(model, calibration_dataset=calibration_dataset, **q_kwargs)
 
-    _remove_f16_kv_cache_precision_flag(quantized_model)
-    _add_nncf_version_flag(quantized_model)
+    if isinstance(model, openvino.Model):
+        _remove_f16_kv_cache_precision_flag(quantized_model)
+        _add_nncf_version_flag(quantized_model)
 
     return quantized_model
 
