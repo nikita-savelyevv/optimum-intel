@@ -1331,7 +1331,7 @@ class ORTCalibrationDatasetBuilder(CalibrationDatasetBuilder):
             submodel: Union[ORTEncoder, ORTDecoderForSeq2Seq] = getattr(self.model, submodel_name)
             submodels[submodel_name] = submodel
             collected_inputs[submodel_name] = []
-            submodel.session = InferRequestWrapper(submodel.session, collected_inputs[submodel_name])
+            submodel.session = ORTSessionWrapper(submodel.session, collected_inputs[submodel_name])
             
         try:
             processor = AutoProcessor.from_pretrained(config.processor, trust_remote_code=config.trust_remote_code)
@@ -1535,6 +1535,10 @@ class OVQuantizer(OptimumQuantizer):
                 calibration_dataset,
                 **kwargs,
             )
+        elif isinstance(self.model, ORTModel):
+            if save_directory is None:
+                raise ValueError("Please provide `save_directory` if `ORTModel` is used.")
+            self._quantize_onnx_model(ov_config, save_directory, calibration_dataset, **kwargs)
         elif isinstance(self.model, torch.nn.Module):
             logger.warning(
                 "The support of `torch.nn.Module` will be deprecated in a future release of optimum-intel, please use the corresponding `OVModelForXxx` class to load you model."
@@ -1547,10 +1551,6 @@ class OVQuantizer(OptimumQuantizer):
                 file_name,
                 **kwargs,
             )
-        elif isinstance(self.model, ORTModel):
-            if save_directory is None:
-                raise ValueError("Please provide `save_directory` if `ORTModel` is used.")
-            self._quantize_onnx_model(ov_config, save_directory, calibration_dataset, **kwargs)
         else:
             raise TypeError(f"Unsupported model type: {type(self.model)}")
 
@@ -1782,9 +1782,10 @@ class OVQuantizer(OptimumQuantizer):
                         f"Calibration dataset for submodel {submodel_name} is required to run quantization."
                     )
                 if isinstance(config, OVQuantizationConfig):
-                    kwargs["advanced_parameters"] = nncf.AdvancedQuantizationParameters(
-                        backend_params={BackendParameters.EXTERNAL_DATA_DIR: save_directory}
-                    )
+                    # TODO: properly process advanced parameters
+                    # kwargs["advanced_parameters"] = nncf.AdvancedQuantizationParameters(
+                    #     backend_params={BackendParameters.EXTERNAL_DATA_DIR: save_directory}
+                    # )
                     quantized_model = _full_quantization(submodel, config, nncf_dataset, **kwargs)
                 else:
                     # TODO add advanced params

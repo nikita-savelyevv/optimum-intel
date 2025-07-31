@@ -11,13 +11,14 @@
 
 import time
 from pathlib import Path
-
+import numpy as np
 import onnx
 
-from optimum.intel import OVQuantizer, OVConfig, OVWeightQuantizationConfig
+from optimum.intel import OVQuantizer, OVConfig, OVWeightQuantizationConfig, OVQuantizationConfig
 from optimum.intel.openvino import OVModelForCausalLM
 from optimum.onnxruntime import ORTModelForCausalLM, ORTModelForSpeechSeq2Seq
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor
+from datasets import load_dataset
 
 import nncf
 from nncf.onnx.quantization.backend_parameters import BackendParameters
@@ -25,58 +26,78 @@ from nncf.onnx.quantization.backend_parameters import BackendParameters
 ROOT = Path(__file__).parent.resolve()
 
 
-MODEL_ID = "PY007/TinyLlama-1.1B-Chat-v0.3"
+# MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 # MODEL_ID = "HuggingFaceM4/tiny-random-LlamaForCausalLM"
-# MODEL_ID = "openai/tiny-whisper"
-OUTPUT_DIR = ROOT / "tinyllama_compressed"
+MODEL_ID = "openai/whisper-tiny"
+# OUTPUT_DIR = ROOT / "ort_quantized_model/tiny-llama-se"
+OUTPUT_DIR = ROOT / "ort_quantized_model/tmp"
 
 
 def main():
-    model = ORTModelForCausalLM.from_pretrained(MODEL_ID, export=True)
-    # model.save_pretrained(OUTPUT_DIR)
+    # ort_model_cls = ORTModelForCausalLM
+    ort_model_cls = ORTModelForSpeechSeq2Seq
 
-    # model = ORTModelForSpeechSeq2Seq.from_pretrained("openai/whisper-tiny", export=True)
-    # model.save_pretrained("./whisper_tiny")
-    # exit(0)
-
-    # onnx_model = onnx.load(OUTPUT_DIR / "model.onnx", load_external_data=False)
-    # compressed_onnx_model = nncf.compress_weights(
-    #     onnx_model,
-    #     mode=nncf.CompressWeightsMode.INT8_ASYM,
-    #     advanced_parameters=nncf.AdvancedCompressionParameters(
-    #         backend_params={BackendParameters.EXTERNAL_DATA_DIR: OUTPUT_DIR}
-    #     ),
-    # )
-    # onnx.save(compressed_onnx_model, OUTPUT_DIR / "model.onnx", save_as_external_data=True)
-
+    model = ort_model_cls.from_pretrained(MODEL_ID, export=True)
     OVQuantizer(model).quantize(
         save_directory=OUTPUT_DIR,
         ov_config=OVConfig(
-            quantization_config=OVWeightQuantizationConfig(
-                bits=4,
-                dataset="wikitext2",
-                tokenizer=MODEL_ID,
-                ignored_scope=dict(types=["Gather"]),
-                scale_estimation=True,
-            ),
+            quantization_config=OVQuantizationConfig(dataset="librispeech", processor=MODEL_ID)
+            # quantization_config=OVWeightQuantizationConfig(
+            #     bits=8,
+            #     sym=True,
+            #     # bits=4,
+            #     # all_layers=True,
+            #     # ignored_scope=dict(types=["Gather"]),
+            #     # scale_estimation=True,
+            #     # dataset="wikitext2",
+            #     # tokenizer=MODEL_ID,
+            # ),
         )
     )
 
     # Infer Model.
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
-    # ov_model = OVModelForCausalLM.from_pretrained(OUTPUT_DIR, from_onnx=True)
-    ov_model = ORTModelForCausalLM.from_pretrained(OUTPUT_DIR)
+    if ort_model_cls == ORTModelForCausalLM:
+        # ov_model = OVModelForCausalLM.from_pretrained(OUTPUT_DIR, from_onnx=True)
+        ov_model = ort_model_cls.from_pretrained(OUTPUT_DIR)
 
-    input_ids = tokenizer("What is PyTorch?", return_tensors="pt").to(device=model.device)
+        messages = [{"role": "user", "content": "What is PyTorch?"}]
+        input_ids = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+        )
 
-    start_t = time.time()
-    output = ov_model.generate(**input_ids, max_new_tokens=100)
-    print("Elapsed time: ", time.time() - start_t)
+        start_t = time.time()
+        output = ov_model.generate(input_ids, max_new_tokens=100)
+        print("Elapsed time: ", time.time() - start_t)
 
-    output_text = tokenizer.decode(output[0])
-    print(output_text)
-    return output_text
+        output_text = tokenizer.decode(output[0])
+        print(output_text)
+        return output_text
+    elif ort_model_cls == ORTModelForSpeechSeq2Seq:
+        ov_model = ort_model_cls.from_pretrained(OUTPUT_DIR)
+        processor = AutoProcessor.from_pretrained(MODEL_ID)
+
+        def extract_input_features(sample):
+            audio = sample["audio"]["array"]
+            sampling_rate = sample["audio"]["sampling_rate"]
+            if sampling_rate != 16000:
+                duration = audio.shape[0] / sampling_rate
+                resampled_data = np.zeros(shape=(int(duration * 16000)), dtype=np.float32)
+                x_old = np.linspace(0, duration, audio.shape[0], dtype=np.float32)
+                x_new = np.linspace(0, duration, resampled_data.shape[0], dtype=np.float32)
+                audio = np.interp(x_new, x_old, audio)
+
+            input_features = processor(audio, sampling_rate=16000, return_tensors="pt").input_features
+
+            return input_features
+
+        dataset = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+        input_features = extract_input_features(dataset[0])
+        transcription = processor.batch_decode(ov_model.generate(input_features), skip_special_tokens=True)[0]
+        print(f'\nQuantized model transcription: "{transcription.strip()}"')
+    else:
+        raise ValueError(f"Unsupported model class: {ort_model_cls}")
 
 
 if __name__ == "__main__":
