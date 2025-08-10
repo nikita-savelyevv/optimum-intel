@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from io import BytesIO
 from itertools import islice
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
 import datasets
 import nncf
@@ -36,18 +36,15 @@ from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
 from nncf.onnx.quantization.backend_parameters import BackendParameters
 from nncf.quantization.advanced_parameters import OverflowFix
 from nncf.torch import register_module
-from nncf.torch.initialization import PTInitializingDataLoader
 from onnxruntime import InferenceSession
 from openvino import Core, Tensor
 from openvino._offline_transformations import compress_quantize_weights_transformation
 from PIL import Image
-from optimum.onnxruntime import ORTModel, ORTModelForCausalLM
 from torch.utils._pytree import tree_map
 from torch.utils.data import DataLoader, RandomSampler
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer, DataCollator, PreTrainedModel, default_data_collator
 from transformers.pytorch_utils import Conv1D
-from transformers.utils import is_accelerate_available
 
 from optimum.exporters.tasks import TasksManager
 from optimum.quantization_base import OptimumQuantizer
@@ -224,10 +221,11 @@ class ORTSessionWrapper:
     ):
         self.session = session
         self.collected_inputs = [] if collected_inputs is None else collected_inputs
-        
+
     def run(self, output_names, input_feed, run_options=None):
         self.collected_inputs.append(copy.deepcopy(input_feed))
         return self.session.run(output_names, input_feed, run_options)
+
 
 class CalibrationDatasetBuilder:
     """
@@ -254,10 +252,6 @@ class CalibrationDatasetBuilder:
         """
         self.model = model
         self.seed = seed
-        # TODO: deprecate "signature_columns": model.forward() may not be the method which is called during inference,
-        #  for example there is model.generate()
-        signature = inspect.signature(self.model.forward)
-        self._signature_columns = list(signature.parameters.keys())
 
     def build_from_quantization_config(self, config: OVQuantizationConfigBase) -> CalibrationDataset:
         """
@@ -469,8 +463,17 @@ class CalibrationDatasetBuilder:
     def _remove_unused_columns(self, dataset: "Dataset"):
         # TODO: deprecate because model.forward() may not be the method which is called during inference,
         #  for example there is model.generate()
-        ignored_columns = list(set(dataset.column_names) - set(self._signature_columns))
+        signature = inspect.signature(self.model.forward)
+        signature_columns = list(signature.parameters.keys())
+        ignored_columns = list(set(dataset.column_names) - set(signature_columns))
         return dataset.remove_columns(ignored_columns)
+
+    def disable_progress_bar(self, disable: bool = True) -> None:
+        if not hasattr(self.model, "_progress_bar_config"):
+            self.model._progress_bar_config = {"disable": disable}
+        else:
+            self.model._progress_bar_config["disable"] = disable
+
 
 class OVCalibrationDatasetBuilder(CalibrationDatasetBuilder):
     def build_from_quantization_config(self, config: OVQuantizationConfigBase) -> CalibrationDataset:
@@ -714,7 +717,6 @@ class OVCalibrationDatasetBuilder(CalibrationDatasetBuilder):
         """
         Prepares calibration data for causal language models. Relies on `optimum.gptq.data` module.
         """
-        from optimum.intel.openvino import OVModelForCausalLM
         from optimum.gptq.data import get_dataset, prepare_dataset
 
         tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=config.trust_remote_code)
@@ -732,7 +734,6 @@ class OVCalibrationDatasetBuilder(CalibrationDatasetBuilder):
         calibration_dataset = prepare_dataset(calibration_dataset)
         calibration_dataset = nncf.Dataset(calibration_dataset, lambda x: self.model.prepare_inputs(**x))
         return CalibrationDataset(calibration_dataset)
-
 
     def _prepare_visual_causal_lm_calibration_data(
         self,
@@ -918,18 +919,6 @@ class OVCalibrationDatasetBuilder(CalibrationDatasetBuilder):
             self.disable_progress_bar(disable=False)
 
         return CalibrationDataset({diffuser_model_name: nncf.Dataset(calibration_data[:num_samples])})
-
-    def _remove_unused_columns(self, dataset: "Dataset"):
-        # TODO: deprecate because model.forward() may not be the method which is called during inference,
-        #  for example there is model.generate()
-        ignored_columns = list(set(dataset.column_names) - set(self._signature_columns))
-        return dataset.remove_columns(ignored_columns)
-
-    def disable_progress_bar(self, disable: bool = True) -> None:
-        if not hasattr(self.model, "_progress_bar_config"):
-            self.model._progress_bar_config = {"disable": disable}
-        else:
-            self.model._progress_bar_config["disable"] = disable
 
     def _prepare_text_encoder_model_calibration_data(
         self,
@@ -1155,6 +1144,9 @@ class ORTCalibrationDatasetBuilder(CalibrationDatasetBuilder):
         from optimum.onnxruntime import ORTModelForCausalLM, ORTModelForVision2Seq
         from optimum.onnxruntime.modeling_seq2seq import _ORTModelForWhisper
 
+        if is_diffusers_available():
+            from optimum.onnxruntime import ORTDiffusionPipeline
+
         if config.dataset is None:
             raise ValueError("Please provide a dataset for calibration.")
 
@@ -1193,6 +1185,25 @@ class ORTCalibrationDatasetBuilder(CalibrationDatasetBuilder):
                 )
             else:
                 raise Exception()
+        elif is_diffusers_available() and isinstance(self.model, ORTDiffusionPipeline):
+            if isinstance(config.dataset, str):
+                dataset_name = config.dataset
+                dataset_metadata = PREDEFINED_SD_DATASETS[dataset_name]
+
+                dataset = self.load_dataset(
+                    dataset_name,
+                    num_samples=config.num_samples,  # This is an upper bound on how many prompts are needed
+                    dataset_split=dataset_metadata["split"],
+                    streaming=dataset_metadata["streaming"],
+                )
+            elif isinstance(config.dataset, list) and all(isinstance(it, str) for it in config.dataset):
+                dataset = config.dataset
+            else:
+                raise RuntimeError(
+                    "Please provide dataset as one of the accepted dataset labels or as a list of string prompts."
+                )
+
+            return self.build_from_dataset(config, dataset)
         else:
             raise RuntimeError("Unsupported model type for calibration dataset collection.")
 
@@ -1207,10 +1218,15 @@ class ORTCalibrationDatasetBuilder(CalibrationDatasetBuilder):
         from optimum.onnxruntime import ORTModelForVision2Seq
         from optimum.onnxruntime.modeling_seq2seq import _ORTModelForWhisper
 
+        if is_diffusers_available():
+            from optimum.onnxruntime import ORTDiffusionPipeline
+
         if isinstance(self.model, ORTModelForVision2Seq):
             return self._prepare_visual_causal_lm_calibration_data(quantization_config, dataset)
         elif isinstance(self.model, _ORTModelForWhisper):
             return self._prepare_speech_to_text_calibration_data(quantization_config, dataset)
+        elif is_diffusers_available() and isinstance(self.model, ORTDiffusionPipeline):
+            return self._prepare_diffusion_calibration_data(quantization_config, dataset)
         else:
             raise RuntimeError("Unsupported model type for calibration dataset collection.")
 
@@ -1255,19 +1271,19 @@ class ORTCalibrationDatasetBuilder(CalibrationDatasetBuilder):
         Currently, collects data only for a language model component.
         """
 
-        from optimum.onnxruntime.modeling_seq2seq import ORTEncoder, ORTDecoderForSeq2Seq
+        from optimum.onnxruntime.modeling_seq2seq import ORTDecoderForSeq2Seq, ORTEncoder
 
         submodels: Dict[str, Union[ORTEncoder, ORTDecoderForSeq2Seq]] = {}
         collected_inputs: Dict[str, List[Dict[str, Any]]] = {}
         submodel_names = ["encoder", "decoder"]
         if self.model.use_cache and not self.model.use_merged:
-           submodel_names.append("decoder_with_past") 
+            submodel_names.append("decoder_with_past")
         for submodel_name in submodel_names:
             submodel: Union[ORTEncoder, ORTDecoderForSeq2Seq] = getattr(self.model, submodel_name)
             submodels[submodel_name] = submodel
             collected_inputs[submodel_name] = []
             submodel.session = InferRequestWrapper(submodel.session, collected_inputs[submodel_name])
-        
+
         processor = AutoProcessor.from_pretrained(config.processor, trust_remote_code=config.trust_remote_code)
         try:
             tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=config.trust_remote_code)
@@ -1277,13 +1293,13 @@ class ORTCalibrationDatasetBuilder(CalibrationDatasetBuilder):
 
         try:
             dataset_metadata = PREDEFINED_VISUAL_LM_DATASETS[config.dataset]
-    
+
             calibration_data = []
             num_samples = config.num_samples or 32
             for item in tqdm(dataset, desc="Collecting calibration dataset", total=num_samples):
                 if len(calibration_data) > num_samples:
                     break
-    
+
                 instruction = item[dataset_metadata["inputs"]["instruction"]]
                 image_url = item[dataset_metadata["inputs"]["image_url"]]
                 image = Image.open(requests.get(image_url, stream=True).raw).convert("RGB")
@@ -1293,16 +1309,20 @@ class ORTCalibrationDatasetBuilder(CalibrationDatasetBuilder):
                     if scale_factor > 1:
                         new_size = (int(image.size[0] / scale_factor), int(image.size[1] / scale_factor))
                         image = image.resize(new_size)
-    
+
                 try:
                     inputs = self.model.preprocess_inputs(
-                        text=instruction, image=image, processor=processor, tokenizer=tokenizer, config=self.model.config
+                        text=instruction,
+                        image=image,
+                        processor=processor,
+                        tokenizer=tokenizer,
+                        config=self.model.config,
                     )
                 except ValueError as value_error:
                     if "Tokenizer is required." in str(value_error) and tokenizer_error is not None:
                         raise tokenizer_error
                     raise value_error
-    
+
                 self.model.forward(**inputs)
         finally:
             for model in submodels.values():
@@ -1320,19 +1340,19 @@ class ORTCalibrationDatasetBuilder(CalibrationDatasetBuilder):
         Prepares calibration data for speech-to-text pipelines by inferring it on a dataset and collecting incurred inputs.
         """
 
-        from optimum.onnxruntime.modeling_seq2seq import ORTEncoder, ORTDecoderForSeq2Seq
+        from optimum.onnxruntime.modeling_seq2seq import ORTDecoderForSeq2Seq, ORTEncoder
 
         submodels: Dict[str, Union[ORTEncoder, ORTDecoderForSeq2Seq]] = {}
         collected_inputs: Dict[str, List[Dict[str, Any]]] = {}
         submodel_names = ["encoder", "decoder"]
         if self.model.use_cache and not self.model.use_merged:
-           submodel_names.append("decoder_with_past") 
+            submodel_names.append("decoder_with_past")
         for submodel_name in submodel_names:
             submodel: Union[ORTEncoder, ORTDecoderForSeq2Seq] = getattr(self.model, submodel_name)
             submodels[submodel_name] = submodel
             collected_inputs[submodel_name] = []
             submodel.session = ORTSessionWrapper(submodel.session, collected_inputs[submodel_name])
-            
+
         try:
             processor = AutoProcessor.from_pretrained(config.processor, trust_remote_code=config.trust_remote_code)
 
@@ -1354,6 +1374,44 @@ class ORTCalibrationDatasetBuilder(CalibrationDatasetBuilder):
 
         return CalibrationDataset(collected_inputs)
 
+    def _prepare_diffusion_calibration_data(
+        self, config: OVQuantizationConfigBase, dataset: Union[List, "Dataset"]
+    ) -> CalibrationDataset:
+        """
+        Prepares calibration data for diffusion models by inferring it on a dataset. Currently, collects data only for
+        a vision diffusion component.
+        """
+
+        diffuser_model_name = "unet" if self.model.unet is not None else "transformer"
+        diffuser = getattr(self.model, diffuser_model_name)
+
+        size = diffuser.config.get("sample_size", 64) * self.model.vae_scale_factor
+        height, width = 2 * (min(size, 512),)
+
+        num_samples = config.num_samples or 200
+        calibration_data = []
+        try:
+            self.disable_progress_bar(disable=True)
+            diffuser.session = ORTSessionWrapper(diffuser.session, calibration_data)
+
+            pbar = tqdm(total=num_samples, desc="Collecting calibration data")
+            for item in dataset:
+                prompt = (
+                    item[PREDEFINED_SD_DATASETS[config.dataset]["prompt_column_name"]]
+                    if isinstance(item, dict)
+                    else item
+                )
+                # self.model(prompt, height=height, width=width, num_inference_steps=1)
+                self.model(prompt, height=height, width=width)
+                pbar.update(min(num_samples, len(calibration_data)) - pbar.n)
+                if len(calibration_data) >= num_samples:
+                    calibration_data = calibration_data[:num_samples]
+                    break
+        finally:
+            diffuser.session = diffuser.session.session
+            self.disable_progress_bar(disable=False)
+
+        return CalibrationDataset({diffuser_model_name: nncf.Dataset(calibration_data[:num_samples])})
 
 
 class OVQuantizer(OptimumQuantizer):
@@ -1374,12 +1432,14 @@ class OVQuantizer(OptimumQuantizer):
         super().__init__()
 
         from optimum.intel.openvino.modeling_base import OVBaseModel
+        from optimum.onnxruntime import ORTModel
+        from optimum.onnxruntime.base import ORTParentMixin
 
         self.model = model
         self.task = task
         if isinstance(self.model, OVBaseModel):
             self.dataset_builder = OVCalibrationDatasetBuilder(model, seed)
-        elif isinstance(self.model, ORTModel):
+        elif isinstance(self.model, (ORTModel, ORTParentMixin)):
             self.dataset_builder = ORTCalibrationDatasetBuilder(model, seed)
         else:
             raise RuntimeError("Unsupported model type for calibration dataset collection.")
@@ -1522,6 +1582,9 @@ class OVQuantizer(OptimumQuantizer):
                     quantization_config, calibration_dataset, batch_size, data_collator, remove_unused_columns
                 )
 
+        from optimum.onnxruntime import ORTModel
+        from optimum.onnxruntime.base import ORTParentMixin
+
         from .modeling_base import OVBaseModel
 
         if isinstance(self.model, OVBaseModel):
@@ -1535,7 +1598,7 @@ class OVQuantizer(OptimumQuantizer):
                 calibration_dataset,
                 **kwargs,
             )
-        elif isinstance(self.model, ORTModel):
+        elif isinstance(self.model, (ORTModel, ORTParentMixin)):
             if save_directory is None:
                 raise ValueError("Please provide `save_directory` if `ORTModel` is used.")
             self._quantize_onnx_model(ov_config, save_directory, calibration_dataset, **kwargs)
@@ -1739,13 +1802,15 @@ class OVQuantizer(OptimumQuantizer):
         from optimum.onnxruntime import ORTModelForCausalLM, ORTModelForVision2Seq
         from optimum.onnxruntime.modeling_seq2seq import _ORTModelForWhisper
 
+        if is_diffusers_available():
+            from optimum.onnxruntime import ORTDiffusionPipeline
+            from optimum.onnxruntime.modeling_diffusion import ORTModelMixin
+
+        save_directory = Path(save_directory)
+
         quantization_config = ov_config.quantization_config
         if calibration_dataset is None and quantization_config.dataset is not None:
             calibration_dataset = self.dataset_builder.build_from_quantization_config(quantization_config)
-
-        quantization_configs = self._prepare_ort_per_model_quantization_configs(
-            quantization_config, calibration_dataset, **kwargs
-        )
 
         if isinstance(self.model, ORTModelForCausalLM):
             submodel_names = ["model"]
@@ -1753,8 +1818,17 @@ class OVQuantizer(OptimumQuantizer):
             submodel_names = ["encoder", "decoder"]
             if self.model.use_cache and not self.model.use_merged:
                 submodel_names.append("decoder_with_past")
+        elif is_diffusers_available() and isinstance(self.model, ORTDiffusionPipeline):
+            submodel_names = []
+            for submodel_name, submodel in self.model.__dict__.items():
+                if isinstance(submodel, ORTModelMixin):
+                    submodel_names.append(submodel_name)
         else:
             raise ValueError(f"Unsupported model: {type(self.model)}")
+
+        quantization_configs = self._prepare_ort_per_model_quantization_configs(
+            quantization_config, submodel_names, calibration_dataset, **kwargs
+        )
 
         self.model.save_pretrained(save_directory)
 
@@ -1764,29 +1838,30 @@ class OVQuantizer(OptimumQuantizer):
                     f"Unexpected submodel name encountered during applying quantization: {submodel_name}. "
                     f"Available submodels: {list(self.model.ov_submodels.keys())}."
                 )
-            submodel_filename = f"{submodel_name}_model.onnx" if submodel_name != "model" else "model.onnx"
-            submodel = onnx.load(f"{save_directory}/{submodel_filename}", load_external_data=False)
+            if is_diffusers_available() and isinstance(self.model, ORTDiffusionPipeline):
+                model_dir = save_directory / submodel_name
+                submodel_filename = "model.onnx"
+            else:
+                model_dir = save_directory
+                submodel_filename = f"{submodel_name}_model.onnx" if submodel_name != "model" else "model.onnx"
+            load_external_data = not (model_dir / submodel_filename).with_suffix(".onnx_data").exists()
+            submodel = onnx.load(model_dir / submodel_filename, load_external_data=load_external_data)
             nncf_dataset = calibration_dataset.get(submodel_name, None) if calibration_dataset else None
 
-            # if isinstance(config, OVWeightQuantizationConfig) and config.quant_method == OVQuantizationMethod.HYBRID:
-            #     config = _get_hybrid_mixed_quantization_config(submodel, config, **kwargs)
-
+            backend_params = None if load_external_data else {BackendParameters.EXTERNAL_DATA_DIR: model_dir}
             if isinstance(config, OVWeightQuantizationConfig):
-                kwargs["advanced_parameters"] = nncf.AdvancedCompressionParameters(
-                    backend_params={BackendParameters.EXTERNAL_DATA_DIR: save_directory}
+                quantized_model = _weight_only_quantization(
+                    submodel, config, nncf_dataset, backend_params=backend_params, **kwargs
                 )
-                quantized_model = _weight_only_quantization(submodel, config, nncf_dataset, **kwargs)
             elif isinstance(config, (OVQuantizationConfig, OVMixedQuantizationConfig)):
                 if nncf_dataset is None:
                     raise ValueError(
                         f"Calibration dataset for submodel {submodel_name} is required to run quantization."
                     )
                 if isinstance(config, OVQuantizationConfig):
-                    # TODO: properly process advanced parameters
-                    # kwargs["advanced_parameters"] = nncf.AdvancedQuantizationParameters(
-                    #     backend_params={BackendParameters.EXTERNAL_DATA_DIR: save_directory}
-                    # )
-                    quantized_model = _full_quantization(submodel, config, nncf_dataset, **kwargs)
+                    quantized_model = _full_quantization(
+                        submodel, config, nncf_dataset, backend_params=backend_params, **kwargs
+                    )
                 else:
                     # TODO add advanced params
                     quantized_model = _mixed_quantization(submodel, config, nncf_dataset, **kwargs)
@@ -1914,11 +1989,15 @@ class OVQuantizer(OptimumQuantizer):
     def _prepare_ort_per_model_quantization_configs(
         self,
         quantization_config: OVQuantizationConfigBase,
+        submodel_names: List[str],
         calibration_dataset: Optional[CalibrationDataset] = None,
         **kwargs,
     ) -> Dict[str, OVQuantizationConfigBase]:
         from optimum.onnxruntime import ORTModelForCausalLM, ORTModelForVision2Seq
         from optimum.onnxruntime.modeling_seq2seq import _ORTModelForWhisper
+
+        if is_diffusers_available():
+            from optimum.onnxruntime import ORTDiffusionPipeline
 
         quantization_configs = {}
         if isinstance(quantization_config, OVPipelineQuantizationConfig):
@@ -1933,21 +2012,17 @@ class OVQuantizer(OptimumQuantizer):
             if isinstance(self.model, ORTModelForCausalLM):
                 quantization_configs["model"] = quantization_config
             elif isinstance(self.model, ORTModelForVision2Seq):
-                submodel_names = ["encoder", "decoder"]
-                if self.model.use_cache and not self.model.use_merged:
-                    submodel_names.append("decoder_with_past")
                 for submodel_name in submodel_names:
-                        quantization_configs[submodel_name] = (
-                            quantization_config
-                            if submodel_name.startswith("decoder")
-                            else OVWeightQuantizationConfig(bits=8, sym=True)
-                        )
+                    quantization_configs[submodel_name] = (
+                        quantization_config
+                        if submodel_name.startswith("decoder")
+                        else OVWeightQuantizationConfig(bits=8, sym=True)
+                    )
             elif isinstance(self.model, _ORTModelForWhisper):
-                submodel_names = ["encoder", "decoder"]
                 if self.model.use_cache and not self.model.use_merged:
                     submodel_names.append("decoder_with_past")
                 for submodel_name in submodel_names:
-                        quantization_configs[submodel_name] = quantization_config
+                    quantization_configs[submodel_name] = quantization_config
             else:
                 raise ValueError(f"Unsupported model type {type(self.model)}")
         else:
@@ -1965,7 +2040,33 @@ class OVQuantizer(OptimumQuantizer):
                 #
                 # Hybrid quantization
                 #
-                raise NotImplementedError()
+                if is_diffusers_available() and isinstance(self.model, ORTDiffusionPipeline):
+                    if len(calibration_dataset) > 1:
+                        raise ValueError("Calibration datasets for Diffusion models should contain only one value.")
+
+                    # Apply hybrid quantization to diffusion model
+                    diffusion_model_name = next(iter(calibration_dataset))
+
+                    # TODO: implement proper creation of hybrid mixed quantization config for onnx case
+                    # diffusion_model = getattr(self.model, diffusion_model_name).model
+                    # quantization_configs[diffusion_model_name] = _get_hybrid_mixed_quantization_config(
+                    #     diffusion_model, quantization_config, **kwargs
+                    # )
+                    quantization_configs[diffusion_model_name] = OVQuantizationConfig(
+                        num_samples=quantization_config.num_samples or 200,
+                        smooth_quant_alpha=-1,
+                        **kwargs,
+                    )
+
+                    # Apply weight-only quantization to all SD submodels except UNet/Transformer
+                    quantization_config_copy = quantization_config.clone()
+                    quantization_config_copy.dataset = None
+                    quantization_config_copy.quant_method = OVQuantizationMethod.DEFAULT
+                    for submodel_name in submodel_names:
+                        if submodel_name != diffusion_model_name:
+                            quantization_configs[submodel_name] = quantization_config_copy
+                else:
+                    raise NotImplementedError
             elif isinstance(quantization_config, OVQuantizationConfig):
                 #
                 # Full quantization
@@ -2113,6 +2214,7 @@ def _weight_only_quantization(
     model: openvino.Model,
     quantization_config: Union[OVWeightQuantizationConfig, Dict],
     calibration_dataset: Optional[Union[nncf.Dataset, Iterable]] = None,
+    backend_params: Optional[Dict[str, Any]] = None,
     **kwargs,
 ) -> openvino.Model:
     if isinstance(model, openvino.Model):
@@ -2156,7 +2258,15 @@ def _weight_only_quantization(
     advanced_parameters = wc_kwargs.get("advanced_parameters")
     if advanced_parameters is not None and advanced_parameters.statistics_path is not None and dataset is None:
         # Graceful handling of unnecessary statistics_path
-        wc_kwargs["advanced_parameters"] = dataclasses.replace(advanced_parameters, statistics_path=None)
+        advanced_parameters = dataclasses.replace(advanced_parameters, statistics_path=None)
+    if backend_params is not None:
+        advanced_parameters = (
+            dataclasses.replace(advanced_parameters, backend_params=backend_params)
+            if advanced_parameters
+            else nncf.AdvancedCompressionParameters(backend_params=backend_params)
+        )
+    if advanced_parameters is not None:
+        wc_kwargs["advanced_parameters"] = advanced_parameters
 
     compressed_model = nncf.compress_weights(
         model,
@@ -2176,6 +2286,7 @@ def _full_quantization(
     quantization_config: OVQuantizationConfig,
     calibration_dataset: nncf.Dataset,
     verify_not_optimized: bool = True,
+    backend_params=None,
     **kwargs,
 ):
     if not isinstance(quantization_config, OVQuantizationConfig):
@@ -2197,6 +2308,13 @@ def _full_quantization(
         )
     q_kwargs.update(kwargs)
     q_kwargs.pop("weight_only", None)
+
+    if backend_params is not None:
+        if "advanced_parameters" in q_kwargs:
+            advanced_parameters = dataclasses.replace(q_kwargs["advanced_parameters"], backend_params=backend_params)
+        else:
+            advanced_parameters = nncf.AdvancedQuantizationParameters(backend_params=backend_params)
+        q_kwargs["advanced_parameters"] = advanced_parameters
 
     quantized_model = nncf.quantize(model, calibration_dataset=calibration_dataset, **q_kwargs)
 
