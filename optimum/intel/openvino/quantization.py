@@ -118,7 +118,54 @@ class CalibrationDataset(UserDict):
             raise AttributeError
 
 
-class InferRequestWrapper:
+class InferenceWrapper:
+    def __init__(
+        self,
+        collected_inputs: List = None,
+        apply_caching: bool = False,
+        inference_result_mock: Any = None,
+    ):
+        """
+        Args:
+            collected_inputs (`List`, *optional*):
+                List where collected inputs will be stored. If None, an empty list will be created
+                at self.collected_inputs.
+            apply_caching (`bool`, defaults to False):
+                Whether to apply data caching. May improve memory footprint, but results in slight performance overhead
+                due to tensor hash computation.
+            inference_result_mock (`Any`, *optional*):
+                If provided, the target request won't be executed and this value will be returned instead resulting in
+                faster inputs collection. This is useful when the actual model inference can be skipped, and it
+                should not be provided for models which depend on previous inference results, e.g. encoder-decoder pipelines.
+        """
+        self.collected_inputs = [] if collected_inputs is None else collected_inputs
+        self.apply_caching = apply_caching
+        self.inference_result_mock = inference_result_mock
+        self.tensor_cache = {}
+
+    def _collect_inputs(self, inputs):
+        if not self.apply_caching or not isinstance(inputs, dict):
+            self.collected_inputs.append(copy.deepcopy(inputs))
+            return
+
+        copied_inputs = {}
+        for k, v in inputs.items():
+            data = v
+            if isinstance(data, openvino.Tensor):
+                data = data.data
+            if isinstance(data, torch.Tensor):
+                data = data.cpu().numpy()
+            data_hash = hash(data.tobytes())
+
+            # Avoid data copying if tensor contains data encountered earlier
+            self.tensor_cache.setdefault(k, {})
+            if data_hash not in self.tensor_cache[k]:
+                self.tensor_cache[k][data_hash] = copy.deepcopy(v)
+            copied_inputs[k] = self.tensor_cache[k][data_hash]
+        self.collected_inputs.append(copied_inputs)
+
+
+class InferRequestWrapper(InferenceWrapper):
     """
     Wrapper class for OV InferRequest or CompiledModel objects that collects inputs which they were called with to
     a list.
@@ -146,44 +193,20 @@ class InferRequestWrapper:
                 faster inputs collection. This is useful when the actual model inference can be skipped, and it
                 should not be provided for models which depend on previous inference results, e.g. encoder-decoder pipelines.
         """
+        super().__init__(collected_inputs, apply_caching, inference_result_mock)
         self.request = request
-        self.collected_inputs = [] if collected_inputs is None else collected_inputs
-        self.apply_caching = apply_caching
-        self.inference_result_mock = inference_result_mock
-        self.tensor_cache = {}
-
-    def collect_inputs(self, inputs):
-        if not self.apply_caching or not isinstance(inputs, dict):
-            self.collected_inputs.append(copy.deepcopy(inputs))
-            return
-
-        copied_inputs = {}
-        for k, v in inputs.items():
-            data = v
-            if isinstance(data, openvino.Tensor):
-                data = data.data
-            if isinstance(data, torch.Tensor):
-                data = data.cpu().numpy()
-            data_hash = hash(data.tobytes())
-
-            # Avoid data copying if tensor contains data encountered earlier
-            self.tensor_cache.setdefault(k, {})
-            if data_hash not in self.tensor_cache[k]:
-                self.tensor_cache[k][data_hash] = copy.deepcopy(v)
-            copied_inputs[k] = self.tensor_cache[k][data_hash]
-        self.collected_inputs.append(copied_inputs)
 
     def __call__(self, *args, **kwargs):
         # If __call__ is invoked then self.request must be an instance of CompiledModel
         signature = inspect.signature(self.request)
         bound_args = signature.bind(*args, **kwargs).arguments
-        self.collect_inputs(bound_args["inputs"])
+        self._collect_inputs(bound_args["inputs"])
         if self.inference_result_mock is None:
             return self.request(*args, **kwargs)
         return self.inference_result_mock
 
     def infer(self, inputs: Any = None, share_inputs: bool = False):
-        self.collect_inputs(inputs)
+        self._collect_inputs(inputs)
         if self.inference_result_mock is None:
             return self.request.infer(inputs, share_inputs)
         return self.inference_result_mock
@@ -196,7 +219,7 @@ class InferRequestWrapper:
         *,
         shared_memory: Any = None,
     ):
-        self.collect_inputs(inputs)
+        self._collect_inputs(inputs)
         if self.inference_result_mock is None:
             self.request.infer(inputs, share_inputs, share_outputs=True)
         return self.inference_result_mock
@@ -213,17 +236,23 @@ class InferRequestWrapper:
         return getattr(self.request, attr)
 
 
-class ORTSessionWrapper:
+class ORTSessionWrapper(InferenceWrapper):
     def __init__(
         self,
         session: Union[InferenceSession],
         collected_inputs: List = None,
+        apply_caching: bool = False,
+        inference_result_mock: Any = None,
     ):
+        super().__init__(collected_inputs, apply_caching, inference_result_mock)
         self.session = session
         self.collected_inputs = [] if collected_inputs is None else collected_inputs
 
     def run(self, output_names, input_feed, run_options=None):
-        self.collected_inputs.append(copy.deepcopy(input_feed))
+        self._collect_inputs(input_feed)
+        if self.inference_result_mock is not None:
+            # If inference result mock is provided, return it instead of running the session
+            return self.inference_result_mock
         return self.session.run(output_names, input_feed, run_options)
 
 
@@ -1215,18 +1244,17 @@ class ORTCalibrationDatasetBuilder(CalibrationDatasetBuilder):
         data_collator: Optional[DataCollator] = None,
         remove_unused_columns: bool = False,
     ) -> CalibrationDataset:
-        from optimum.onnxruntime import ORTModelForVision2Seq
         from optimum.onnxruntime.modeling_seq2seq import _ORTModelForWhisper
 
         if is_diffusers_available():
             from optimum.onnxruntime import ORTDiffusionPipeline
 
-        if isinstance(self.model, ORTModelForVision2Seq):
-            return self._prepare_visual_causal_lm_calibration_data(quantization_config, dataset)
-        elif isinstance(self.model, _ORTModelForWhisper):
+        if isinstance(self.model, _ORTModelForWhisper):
             return self._prepare_speech_to_text_calibration_data(quantization_config, dataset)
         elif is_diffusers_available() and isinstance(self.model, ORTDiffusionPipeline):
             return self._prepare_diffusion_calibration_data(quantization_config, dataset)
+        # elif isinstance(self.model, ORTModelForVision2Seq):
+        #     return self._prepare_visual_causal_lm_calibration_data(quantization_config, dataset)
         else:
             raise RuntimeError("Unsupported model type for calibration dataset collection.")
 
@@ -1249,8 +1277,15 @@ class ORTCalibrationDatasetBuilder(CalibrationDatasetBuilder):
             raise ValueError("Please provide dataset as one of the accepted dataset labels or as a list of strings.")
         calibration_dataset = prepare_dataset(calibration_dataset)
 
+        inference_result_mock = []
+        for output_name, output_shape in self.model.output_shapes.items():
+            output_shape = [1 if isinstance(it, str) else it for it in output_shape]
+            inference_result_mock.append(np.empty(output_shape, np.float32))
+
         collected_inputs = []
-        self.model.session = ORTSessionWrapper(self.model.session, collected_inputs)
+        self.model.session = ORTSessionWrapper(
+            self.model.session, collected_inputs, inference_result_mock=inference_result_mock
+        )
         try:
             for data in tqdm(calibration_dataset, desc="Collecting calibration data", total=nsamples):
                 self.model.generate(**data, max_new_tokens=1)
@@ -1260,78 +1295,78 @@ class ORTCalibrationDatasetBuilder(CalibrationDatasetBuilder):
         calibration_dataset = nncf.Dataset(collected_inputs)
         return CalibrationDataset(calibration_dataset)
 
-    def _prepare_visual_causal_lm_calibration_data(
-        self,
-        config: OVQuantizationConfigBase,
-        dataset: "Dataset",
-        max_image_size: Optional[int] = 600,
-    ) -> CalibrationDataset:
-        """
-        Prepares calibration data for VLM pipelines.
-        Currently, collects data only for a language model component.
-        """
-
-        from optimum.onnxruntime.modeling_seq2seq import ORTDecoderForSeq2Seq, ORTEncoder
-
-        submodels: Dict[str, Union[ORTEncoder, ORTDecoderForSeq2Seq]] = {}
-        collected_inputs: Dict[str, List[Dict[str, Any]]] = {}
-        submodel_names = ["encoder", "decoder"]
-        if self.model.use_cache and not self.model.use_merged:
-            submodel_names.append("decoder_with_past")
-        for submodel_name in submodel_names:
-            submodel: Union[ORTEncoder, ORTDecoderForSeq2Seq] = getattr(self.model, submodel_name)
-            submodels[submodel_name] = submodel
-            collected_inputs[submodel_name] = []
-            submodel.session = InferRequestWrapper(submodel.session, collected_inputs[submodel_name])
-
-        processor = AutoProcessor.from_pretrained(config.processor, trust_remote_code=config.trust_remote_code)
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=config.trust_remote_code)
-            tokenizer_error = None
-        except Exception as tokenizer_error:  # noqa: F841
-            tokenizer = None
-
-        try:
-            dataset_metadata = PREDEFINED_VISUAL_LM_DATASETS[config.dataset]
-
-            calibration_data = []
-            num_samples = config.num_samples or 32
-            for item in tqdm(dataset, desc="Collecting calibration dataset", total=num_samples):
-                if len(calibration_data) > num_samples:
-                    break
-
-                instruction = item[dataset_metadata["inputs"]["instruction"]]
-                image_url = item[dataset_metadata["inputs"]["image_url"]]
-                image = Image.open(requests.get(image_url, stream=True).raw).convert("RGB")
-                if max_image_size is not None:
-                    # To avoid large images, resize them keeping the aspect ratio
-                    scale_factor = max(image.size[0] / max_image_size, image.size[1] / max_image_size)
-                    if scale_factor > 1:
-                        new_size = (int(image.size[0] / scale_factor), int(image.size[1] / scale_factor))
-                        image = image.resize(new_size)
-
-                try:
-                    inputs = self.model.preprocess_inputs(
-                        text=instruction,
-                        image=image,
-                        processor=processor,
-                        tokenizer=tokenizer,
-                        config=self.model.config,
-                    )
-                except ValueError as value_error:
-                    if "Tokenizer is required." in str(value_error) and tokenizer_error is not None:
-                        raise tokenizer_error
-                    raise value_error
-
-                self.model.forward(**inputs)
-        finally:
-            for model in submodels.values():
-                model.session = model.session.session
-
-        for submodel_name in collected_inputs:
-            collected_inputs[submodel_name] = nncf.Dataset(collected_inputs[submodel_name])
-
-        return CalibrationDataset(collected_inputs)
+    # def _prepare_visual_causal_lm_calibration_data(
+    #     self,
+    #     config: OVQuantizationConfigBase,
+    #     dataset: "Dataset",
+    #     max_image_size: Optional[int] = 600,
+    # ) -> CalibrationDataset:
+    #     """
+    #     Prepares calibration data for VLM pipelines.
+    #     Currently, collects data only for a language model component.
+    #     """
+    #
+    #     from optimum.onnxruntime.modeling_seq2seq import ORTDecoderForSeq2Seq, ORTEncoder
+    #
+    #     submodels: Dict[str, Union[ORTEncoder, ORTDecoderForSeq2Seq]] = {}
+    #     collected_inputs: Dict[str, List[Dict[str, Any]]] = {}
+    #     submodel_names = ["encoder", "decoder"]
+    #     if self.model.use_cache and not self.model.use_merged:
+    #         submodel_names.append("decoder_with_past")
+    #     for submodel_name in submodel_names:
+    #         submodel: Union[ORTEncoder, ORTDecoderForSeq2Seq] = getattr(self.model, submodel_name)
+    #         submodels[submodel_name] = submodel
+    #         collected_inputs[submodel_name] = []
+    #         submodel.session = ORTSessionWrapper(submodel.session, collected_inputs[submodel_name])
+    #
+    #     processor = AutoProcessor.from_pretrained(config.processor, trust_remote_code=config.trust_remote_code)
+    #     try:
+    #         tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=config.trust_remote_code)
+    #         tokenizer_error = None
+    #     except Exception as tokenizer_error:  # noqa: F841
+    #         tokenizer = None
+    #
+    #     try:
+    #         dataset_metadata = PREDEFINED_VISUAL_LM_DATASETS[config.dataset]
+    #
+    #         calibration_data = []
+    #         num_samples = config.num_samples or 32
+    #         for item in tqdm(dataset, desc="Collecting calibration dataset", total=num_samples):
+    #             if len(calibration_data) > num_samples:
+    #                 break
+    #
+    #             instruction = item[dataset_metadata["inputs"]["instruction"]]
+    #             image_url = item[dataset_metadata["inputs"]["image_url"]]
+    #             image = Image.open(requests.get(image_url, stream=True).raw).convert("RGB")
+    #             if max_image_size is not None:
+    #                 # To avoid large images, resize them keeping the aspect ratio
+    #                 scale_factor = max(image.size[0] / max_image_size, image.size[1] / max_image_size)
+    #                 if scale_factor > 1:
+    #                     new_size = (int(image.size[0] / scale_factor), int(image.size[1] / scale_factor))
+    #                     image = image.resize(new_size)
+    #
+    #             try:
+    #                 inputs = self.model.preprocess_inputs(
+    #                     text=instruction,
+    #                     image=image,
+    #                     processor=processor,
+    #                     tokenizer=tokenizer,
+    #                     config=self.model.config,
+    #                 )
+    #             except ValueError as value_error:
+    #                 if "Tokenizer is required." in str(value_error) and tokenizer_error is not None:
+    #                     raise tokenizer_error
+    #                 raise value_error
+    #
+    #             self.model.forward(**inputs)
+    #     finally:
+    #         for model in submodels.values():
+    #             model.session = model.session.session
+    #
+    #     for submodel_name in collected_inputs:
+    #         collected_inputs[submodel_name] = nncf.Dataset(collected_inputs[submodel_name])
+    #
+    #     return CalibrationDataset(collected_inputs)
 
     def _prepare_speech_to_text_calibration_data(
         self, config: OVQuantizationConfigBase, dataset: "Dataset"
@@ -1351,7 +1386,7 @@ class ORTCalibrationDatasetBuilder(CalibrationDatasetBuilder):
             submodel: Union[ORTEncoder, ORTDecoderForSeq2Seq] = getattr(self.model, submodel_name)
             submodels[submodel_name] = submodel
             collected_inputs[submodel_name] = []
-            submodel.session = ORTSessionWrapper(submodel.session, collected_inputs[submodel_name])
+            submodel.session = ORTSessionWrapper(submodel.session, collected_inputs[submodel_name], apply_caching=True)
 
         try:
             processor = AutoProcessor.from_pretrained(config.processor, trust_remote_code=config.trust_remote_code)
@@ -1431,18 +1466,15 @@ class OVQuantizer(OptimumQuantizer):
         """
         super().__init__()
 
-        from optimum.intel.openvino.modeling_base import OVBaseModel
         from optimum.onnxruntime import ORTModel
         from optimum.onnxruntime.base import ORTParentMixin
 
         self.model = model
         self.task = task
-        if isinstance(self.model, OVBaseModel):
-            self.dataset_builder = OVCalibrationDatasetBuilder(model, seed)
-        elif isinstance(self.model, (ORTModel, ORTParentMixin)):
+        if isinstance(self.model, (ORTModel, ORTParentMixin)):
             self.dataset_builder = ORTCalibrationDatasetBuilder(model, seed)
         else:
-            raise RuntimeError("Unsupported model type for calibration dataset collection.")
+            self.dataset_builder = OVCalibrationDatasetBuilder(model, seed)
 
     @classmethod
     def from_pretrained(cls, model: PreTrainedModel, **kwargs):
@@ -1830,6 +1862,7 @@ class OVQuantizer(OptimumQuantizer):
             quantization_config, submodel_names, calibration_dataset, **kwargs
         )
 
+        # TODO: can we avoid this step?
         self.model.save_pretrained(save_directory)
 
         for submodel_name, config in quantization_configs.items():
@@ -1874,7 +1907,7 @@ class OVQuantizer(OptimumQuantizer):
             else:
                 getattr(self.model, submodel_name).model = quantized_model
 
-            onnx.save(quantized_model, f"{save_directory}/{submodel_filename}", save_as_external_data=True)
+            onnx.save(quantized_model, f"{model_dir}/{submodel_filename}", save_as_external_data=True)
 
             # TODO: Somehow load quantized components into self.model?
 

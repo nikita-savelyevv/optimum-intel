@@ -55,6 +55,7 @@ from transformers import CLIPFeatureExtractor, CLIPTokenizer
 from transformers.modeling_outputs import ModelOutput
 from transformers.utils import http_user_agent
 
+from optimum.onnxruntime import ORTStableDiffusionPipeline
 from optimum.utils import (
     DIFFUSION_MODEL_TEXT_ENCODER_2_SUBFOLDER,
     DIFFUSION_MODEL_TEXT_ENCODER_SUBFOLDER,
@@ -398,10 +399,10 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
         model_save_dir: Optional[Union[str, Path, TemporaryDirectory]] = None,
         **kwargs,
     ):
-        # same as DiffusionPipeline.from_pretraoned, if called directly, it loads the class in the config
+        # same as DiffusionPipeline.from_pretrained, if called directly, it loads the class in the config
         if cls.__name__ == "OVDiffusionPipeline":
             class_name = config["_class_name"]
-            ov_pipeline_class = _get_ov_class(class_name)
+            ov_pipeline_class = _get_ov_class(class_name, from_onnx=from_onnx)
         else:
             ov_pipeline_class = cls
 
@@ -1695,14 +1696,26 @@ SUPPORTED_OV_PIPELINES = [
     OVLatentConsistencyModelImg2ImgPipeline,
 ]
 
+SUPPORTED_ONNX_PIPELINES = {
+    ORTStableDiffusionPipeline: OVStableDiffusionPipeline,
+}
 
-def _get_ov_class(pipeline_class_name: str, throw_error_if_not_exist: bool = True):
-    for ov_pipeline_class in SUPPORTED_OV_PIPELINES:
-        if (
-            ov_pipeline_class.__name__ == pipeline_class_name
-            or ov_pipeline_class.auto_model_class.__name__ == pipeline_class_name
-        ):
-            return ov_pipeline_class
+
+def _get_ov_class(pipeline_class_name: str, throw_error_if_not_exist: bool = True, from_onnx: bool = False):
+    if from_onnx:
+        for ort_pipeline_class, ov_pipeline_class in SUPPORTED_ONNX_PIPELINES.items():
+            if (
+                ort_pipeline_class.__name__ == pipeline_class_name
+                or ort_pipeline_class.auto_model_class.__name__ == pipeline_class_name
+            ):
+                return ov_pipeline_class
+    else:
+        for ov_pipeline_class in SUPPORTED_OV_PIPELINES:
+            if (
+                ov_pipeline_class.__name__ == pipeline_class_name
+                or ov_pipeline_class.auto_model_class.__name__ == pipeline_class_name
+            ):
+                return ov_pipeline_class
 
     if throw_error_if_not_exist:
         raise ValueError(f"OVDiffusionPipeline can't find a pipeline linked to {pipeline_class_name}")

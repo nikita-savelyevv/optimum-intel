@@ -9,71 +9,99 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 import time
 from pathlib import Path
+
 import numpy as np
-import onnx
-
-from optimum.intel import OVQuantizer, OVConfig, OVWeightQuantizationConfig, OVQuantizationConfig, OVDiffusionPipeline, \
-    OVModelForSpeechSeq2Seq
-from optimum.intel.openvino import OVModelForCausalLM
-from optimum.onnxruntime import ORTModelForCausalLM, ORTModelForSpeechSeq2Seq, ORTDiffusionPipeline
-from transformers import AutoTokenizer, AutoProcessor
 from datasets import load_dataset
+from transformers import AutoProcessor, AutoTokenizer
 
-import nncf
-from nncf.onnx.quantization.backend_parameters import BackendParameters
-
+from optimum.intel import (
+    OVConfig,
+    OVDiffusionPipeline,
+    OVModelForSpeechSeq2Seq,
+    OVQuantizationConfig,
+    OVQuantizer,
+    OVWeightQuantizationConfig,
+)
+from optimum.intel.openvino import OVModelForCausalLM
 from optimum.intel.openvino.configuration import OVQuantizationMethod
+from optimum.onnxruntime import ORTDiffusionPipeline, ORTModelForCausalLM, ORTModelForSpeechSeq2Seq
 
-ROOT = Path(__file__).parent.resolve()
 
+# TASK = "text-generation"
+# TASK = "text-to-image"
+# TASK = "automatic-speech-recognition"
+# APPLY_QUANTIZATION = bool(1)
+# USE_OV_FOR_INFERENCE = bool(1)
 
-# MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-# MODEL_ID = "HuggingFaceM4/tiny-random-LlamaForCausalLM"
-MODEL_ID = "openai/whisper-tiny"
-# MODEL_ID = "stabilityai/stable-diffusion-2-1"
-# OUTPUT_DIR = ROOT / "ort_quantized_model/tiny-llama-se"
-# OUTPUT_DIR = ROOT / "ort_quantized_model/stable-diffusion-2-1/hq"
-OUTPUT_DIR = ROOT / "ort_quantized_model/tmp"
+parser = argparse.ArgumentParser(description="Run model quantization and inference.")
+parser.add_argument(
+    "--task",
+    type=str,
+    choices=["text-generation", "text-to-image", "automatic-speech-recognition"],
+    help="Task to perform.",
+)
+parser.add_argument("--apply-quantization", action="store_true", help="Apply quantization to the model.")
+parser.add_argument(
+    "--use-ov-for-inference", action="store_true", help="Use OpenVINO for inference instead of ONNX Runtime."
+)
+args = parser.parse_args()
+TASK = args.task
+APPLY_QUANTIZATION = args.apply_quantization
+USE_OV_FOR_INFERENCE = args.use_ov_for_inference
 
 
 def main():
-    # ort_model_cls, ov_model_cls = ORTModelForCausalLM, OVModelForCausalLM
-    ort_model_cls, ov_model_cls = ORTModelForSpeechSeq2Seq, OVModelForSpeechSeq2Seq
-    # ort_model_cls, = ORTDiffusionPipeline, OVDiffusionPipeline
-
-    model = ort_model_cls.from_pretrained(MODEL_ID, export=True)
-    # model.save_pretrained(OUTPUT_DIR)
-    OVQuantizer(model).quantize(
-        save_directory=OUTPUT_DIR,
-        ov_config=OVConfig(
-            quantization_config=OVQuantizationConfig(dataset="librispeech", processor=MODEL_ID)
-    #         # quantization_config=OVWeightQuantizationConfig(
-    #         #     bits=8,
-    #         #     sym=True,
-    #         #     # bits=4,
-    #         #     # all_layers=True,
-    #         #     # ignored_scope=dict(types=["Gather"]),
-    #         #     # scale_estimation=True,
-    #         #     # dataset="wikitext2",
-    #         #     # tokenizer=MODEL_ID,
-    #         # ),
-    #         # quantization_config=OVWeightQuantizationConfig(
-    #         #     bits=8,
-    #         #     num_samples=200,
-    #         #     dataset="conceptual_captions",
-    #         #     quant_method=OVQuantizationMethod.HYBRID,
-    #         # )
+    if TASK == "text-generation":
+        ort_model_cls, ov_model_cls = ORTModelForCausalLM, OVModelForCausalLM
+        model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        quantization_config = OVWeightQuantizationConfig(
+            # bits=8,
+            # sym=True,
+            bits=4,
+            # all_layers=True,
+            ignored_scope=dict(types=["Gather"]),
+            scale_estimation=True,
+            dataset="wikitext2",
+            tokenizer=model_id,
         )
-    )
+    elif TASK == "text-to-image":
+        ort_model_cls, ov_model_cls = ORTDiffusionPipeline, OVDiffusionPipeline
+        model_id = "stabilityai/stable-diffusion-2-1"
+        quantization_config = OVWeightQuantizationConfig(
+            bits=8,
+            num_samples=200,
+            dataset="conceptual_captions",
+            quant_method=OVQuantizationMethod.HYBRID,
+        )
+    elif TASK == "automatic-speech-recognition":
+        ort_model_cls, ov_model_cls = ORTModelForSpeechSeq2Seq, OVModelForSpeechSeq2Seq
+        # model_id = "openai/whisper-tiny"
+        model_id = "openai/whisper-medium"
+        quantization_config = OVQuantizationConfig(dataset="librispeech", processor=model_id, num_samples=32)
+    else:
+        raise ValueError(f"Unsupported TASK: {TASK}")
 
-    # Infer Model.
+    model_label = "quantized" if APPLY_QUANTIZATION else "full-precision"
+    output_dir = (Path(".") / "ort_quantized_models" / model_id.split("/")[-1] / model_label).absolute()
+    inference_cls = ov_model_cls if USE_OV_FOR_INFERENCE else ort_model_cls
+
+    # Run the model export and optionally quantization
+    model = ort_model_cls.from_pretrained(model_id, export=True)
+    if APPLY_QUANTIZATION:
+        OVQuantizer(model).quantize(
+            save_directory=output_dir, ov_config=OVConfig(quantization_config=quantization_config)
+        )
+    else:
+        model.save_pretrained(output_dir)
+
+    # Run inference
     if ort_model_cls == ORTModelForCausalLM:
-        # ov_model = ov_model_cls.from_pretrained(OUTPUT_DIR, from_onnx=True)
-        ov_model = ort_model_cls.from_pretrained(OUTPUT_DIR)
+        ov_model = inference_cls.from_pretrained(output_dir, from_onnx=USE_OV_FOR_INFERENCE)
 
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
         messages = [{"role": "user", "content": "What is PyTorch?"}]
         input_ids = tokenizer.apply_chat_template(
             messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
@@ -81,15 +109,16 @@ def main():
 
         start_t = time.time()
         output = ov_model.generate(input_ids, max_new_tokens=100)
-        print("Elapsed time: ", time.time() - start_t)
+        elapsed_time = f"Elapsed time: {time.time() - start_t:.2f} seconds"
+        print(elapsed_time)
 
         output_text = tokenizer.decode(output[0])
-        print(output_text)
-        return output_text
+        with open(output_dir / "output.txt", "w") as f:
+            f.write(output_text + "\n" + elapsed_time)
+        print(f'Model output: "{output_text.strip()}"')
     elif ort_model_cls == ORTModelForSpeechSeq2Seq:
-        ov_model = ov_model_cls.from_pretrained(OUTPUT_DIR, from_onnx=True)
-        # ov_model = ort_model_cls.from_pretrained(OUTPUT_DIR)
-        processor = AutoProcessor.from_pretrained(MODEL_ID)
+        ov_model = inference_cls.from_pretrained(output_dir, from_onnx=USE_OV_FOR_INFERENCE)
+        processor = AutoProcessor.from_pretrained(model_id)
 
         def extract_input_features(sample):
             audio = sample["audio"]["array"]
@@ -109,21 +138,26 @@ def main():
         input_features = extract_input_features(dataset[0])
         start_time = time.time()
         transcription = processor.batch_decode(ov_model.generate(input_features), skip_special_tokens=True)[0]
-        print("Elapsed time: ", time.time() - start_time)
+        elapsed_time = f"Elapsed time: {time.time() - start_time:.2f} seconds"
         print(f'\nQuantized model transcription: "{transcription.strip()}"')
+        print(elapsed_time)
+        with open(output_dir / "transcription.txt", "w") as f:
+            f.write(transcription.strip() + "\n" + elapsed_time)
     elif ort_model_cls == ORTDiffusionPipeline:
-        # ov_model = ov_model_cls.from_pretrained(OUTPUT_DIR, from_onnx=True)
-        ov_model = ort_model_cls.from_pretrained(OUTPUT_DIR)
+        ov_model = inference_cls.from_pretrained(output_dir, from_onnx=USE_OV_FOR_INFERENCE)
 
         # Generate an image.
         prompt = "A painting of a squirrel eating a burger"
         start_t = time.time()
         images = ov_model(prompt, num_inference_steps=50, guidance_scale=7.5).images
-        print("Elapsed time: ", time.time() - start_t)
+        elapsed_time = f"Elapsed time: {time.time() - start_t:.2f} seconds"
+        print(elapsed_time)
+        with open(output_dir / "generation_time.txt", "w") as f:
+            f.write(elapsed_time)
 
         for i, image in enumerate(images):
-            image.save(OUTPUT_DIR / f"generated_image_{i}.png")
-        print(f"Generated {len(images)} images and saved to {OUTPUT_DIR}")
+            image.save(output_dir / f"generated_image_{i}.png")
+        print(f"Generated {len(images)} images and saved to {output_dir}")
     else:
         raise ValueError(f"Unsupported model class: {ort_model_cls}")
 
