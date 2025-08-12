@@ -81,7 +81,10 @@ def main():
     #
     # Run the model export and optionally quantization
     #
-    model = export_cls.from_pretrained(model_id, export=True, load_in_8bit=False)
+    model_kwargs = {}
+    if args.export_backend == "openvino":
+        model_kwargs["load_in_8bit"] = False
+    model = export_cls.from_pretrained(model_id, export=True, **model_kwargs)
     if args.apply_quantization:
         OVQuantizer(model).quantize(
             save_directory=output_dir, ov_config=OVConfig(quantization_config=quantization_config)
