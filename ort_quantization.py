@@ -67,7 +67,7 @@ def main():
         )
     elif args.task == "automatic-speech-recognition":
         ort_model_cls, ov_model_cls = ORTModelForSpeechSeq2Seq, OVModelForSpeechSeq2Seq
-        model_id = "openai/whisper-medium"
+        model_id = "openai/whisper-large-v3-turbo"
         quantization_config = OVQuantizationConfig(dataset="librispeech", processor=model_id, num_samples=32)
     else:
         raise ValueError(f"Unsupported args.task: {args.task}")
