@@ -15,7 +15,9 @@ from pathlib import Path
 
 import numpy as np
 from datasets import load_dataset
+from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer, set_seed
+from jiwer import wer, wer_standardize
 
 from optimum.intel import (
     OVConfig,
@@ -30,54 +32,71 @@ from optimum.intel.openvino.configuration import OVQuantizationMethod
 from optimum.onnxruntime import ORTDiffusionPipeline, ORTModelForCausalLM, ORTModelForSpeechSeq2Seq
 
 
+def extract_input_features(processor, sample):
+    audio = sample["audio"]["array"]
+    sampling_rate = sample["audio"]["sampling_rate"]
+    if sampling_rate != 16000:
+        duration = audio.shape[0] / sampling_rate
+        resampled_data = np.zeros(shape=(int(duration * 16000)), dtype=np.float32)
+        x_old = np.linspace(0, duration, audio.shape[0], dtype=np.float32)
+        x_new = np.linspace(0, duration, resampled_data.shape[0], dtype=np.float32)
+        audio = np.interp(x_new, x_old, audio)
+
+    input_features = processor(audio, sampling_rate=16000, return_tensors="pt").input_features
+
+    return input_features
+
+
 parser = argparse.ArgumentParser(description="Run model quantization and inference.")
 parser.add_argument("--task", type=str, choices=["text-generation", "text-to-image", "automatic-speech-recognition"], help="Task to perform.")
 parser.add_argument("--apply-quantization", action="store_true", help="Apply quantization to the model.")
 parser.add_argument("--export-backend", type=str, default="onnx", choices=["onnx", "openvino"], help="Export backend to use.")
 parser.add_argument("--inference-backend", type=str, default="openvino", choices=["onnx", "openvino"], help="Inference backend to use.")
 parser.add_argument("--n-iter", type=int, default=1, help="Number of iterations for inference.")
+parser.add_argument("--validate", action="store_true", help="Validate instead of exporting")
 args = parser.parse_args()
 
 
+if args.export_backend == "openvino" and args.inference_backend == "onnx":
+    raise ValueError("Cannot run ORT inference on an openvino model")
+
+#
+# Prepare model and quantization configuration
+#
+if args.task == "text-generation":
+    ort_model_cls, ov_model_cls = ORTModelForCausalLM, OVModelForCausalLM
+    model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    quantization_config = OVWeightQuantizationConfig(
+        bits=4,
+        ignored_scope=dict(types=["Gather"]),
+        scale_estimation=True,
+        dataset="wikitext2",
+        tokenizer=model_id,
+    )
+elif args.task == "text-to-image":
+    ort_model_cls, ov_model_cls = ORTDiffusionPipeline, OVDiffusionPipeline
+    model_id = "stabilityai/stable-diffusion-2-1"
+    quantization_config = OVWeightQuantizationConfig(
+        bits=8,
+        num_samples=200,
+        dataset="conceptual_captions",
+        quant_method=OVQuantizationMethod.HYBRID,
+    )
+elif args.task == "automatic-speech-recognition":
+    ort_model_cls, ov_model_cls = ORTModelForSpeechSeq2Seq, OVModelForSpeechSeq2Seq
+    model_id = "openai/whisper-large-v3"
+    quantization_config = OVQuantizationConfig(dataset="librispeech", processor=model_id, num_samples=32)
+else:
+    raise ValueError(f"Unsupported args.task: {args.task}")
+
+precision_label = "quantized" if args.apply_quantization else "full-precision"
+output_dir = Path(".") / "ort_quantized_models" / model_id.split("/")[-1] / args.export_backend / precision_label
+output_dir = output_dir.absolute()
+export_cls = ov_model_cls if args.export_backend == "openvino" else ort_model_cls
+inference_cls = ov_model_cls if args.inference_backend == "openvino" else ort_model_cls
+
+
 def main():
-    if args.export_backend == "openvino" and args.inference_backend == "onnx":
-        raise ValueError("Cannot run ORT inference on an openvino model")
-    
-    #
-    # Prepare model and quantization configuration
-    #
-    if args.task == "text-generation":
-        ort_model_cls, ov_model_cls = ORTModelForCausalLM, OVModelForCausalLM
-        model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-        quantization_config = OVWeightQuantizationConfig(
-            bits=4,
-            ignored_scope=dict(types=["Gather"]),
-            scale_estimation=True,
-            dataset="wikitext2",
-            tokenizer=model_id,
-        )
-    elif args.task == "text-to-image":
-        ort_model_cls, ov_model_cls = ORTDiffusionPipeline, OVDiffusionPipeline
-        model_id = "stabilityai/stable-diffusion-2-1"
-        quantization_config = OVWeightQuantizationConfig(
-            bits=8,
-            num_samples=200,
-            dataset="conceptual_captions",
-            quant_method=OVQuantizationMethod.HYBRID,
-        )
-    elif args.task == "automatic-speech-recognition":
-        ort_model_cls, ov_model_cls = ORTModelForSpeechSeq2Seq, OVModelForSpeechSeq2Seq
-        model_id = "openai/whisper-large-v3-turbo"
-        quantization_config = OVQuantizationConfig(dataset="librispeech", processor=model_id, num_samples=32)
-    else:
-        raise ValueError(f"Unsupported args.task: {args.task}")
-
-    precision_label = "quantized" if args.apply_quantization else "full-precision"
-    output_dir = Path(".") / "ort_quantized_models" / model_id.split("/")[-1] / args.export_backend / precision_label
-    output_dir = output_dir.absolute()
-    export_cls = ov_model_cls if args.export_backend == "openvino" else ort_model_cls
-    inference_cls = ov_model_cls if args.inference_backend == "openvino" else ort_model_cls
-
     #
     # Run the model export and optionally quantization
     #
@@ -125,22 +144,8 @@ def main():
         ov_model = inference_cls.from_pretrained(output_dir, from_onnx=args.export_backend == "onnx")
         processor = AutoProcessor.from_pretrained(model_id)
 
-        def extract_input_features(sample):
-            audio = sample["audio"]["array"]
-            sampling_rate = sample["audio"]["sampling_rate"]
-            if sampling_rate != 16000:
-                duration = audio.shape[0] / sampling_rate
-                resampled_data = np.zeros(shape=(int(duration * 16000)), dtype=np.float32)
-                x_old = np.linspace(0, duration, audio.shape[0], dtype=np.float32)
-                x_new = np.linspace(0, duration, resampled_data.shape[0], dtype=np.float32)
-                audio = np.interp(x_new, x_old, audio)
-
-            input_features = processor(audio, sampling_rate=16000, return_tensors="pt").input_features
-
-            return input_features
-
         dataset = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
-        input_features = extract_input_features(dataset[0])
+        input_features = extract_input_features(processor, dataset[0])
         times = []
         for _ in range(args.n_iter):
             set_seed(0)
@@ -177,5 +182,51 @@ def main():
         raise ValueError(f"Unsupported task: {args.task}")
 
 
+def validate_whisper(test_dataset_size):
+    processor = AutoProcessor.from_pretrained(model_id)
+
+    def calculate_transcription_time_and_accuracy(ov_model, test_samples):
+        infer_times = []
+
+        ground_truths = []
+        predictions = []
+        for data_item in tqdm(test_samples, desc="Measuring performance and accuracy"):
+            input_features = extract_input_features(processor, data_item)
+
+            start_time = time.time()
+            predicted_ids = ov_model.generate(input_features)
+            infer_times.append(time.time() - start_time)
+            transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)
+
+            ground_truths.append(data_item["text"])
+            predictions.append(transcription[0])
+            print(f"Ground truth: {data_item['text']}")
+            print(f"Prediction: {transcription[0]}")
+
+        word_accuracy = (1 - wer(ground_truths, predictions, reference_transform=wer_standardize,
+                                 hypothesis_transform=wer_standardize)) * 100
+        mean_infer_time = sum(infer_times)
+        return word_accuracy, mean_infer_time
+
+    test_dataset = load_dataset("openslr/librispeech_asr", "clean", split="test", streaming=True, trust_remote_code=True)
+    test_dataset = test_dataset.shuffle(seed=0).take(test_dataset_size)
+    test_samples = [sample for sample in test_dataset]
+
+    model = inference_cls.from_pretrained(output_dir, from_onnx=args.export_backend == "onnx")
+
+    accuracy, mean_infer_time = calculate_transcription_time_and_accuracy(model, test_samples)
+    print(f"Word accuracy: {accuracy:.2f}%")
+    print(f"Average inference time: {mean_infer_time:.4f} seconds")
+    with open(output_dir / f"validation.txt", "w") as f:
+        f.write(f"Word accuracy: {accuracy:.2f}%\n")
+        f.write(f"Average inference time: {mean_infer_time:.4f} seconds\n")
+
+
 if __name__ == "__main__":
-    main()
+    if args.validate:
+        if args.task == "automatic-speech-recognition":
+            validate_whisper(test_dataset_size=args.n_iter)
+        else:
+            raise ValueError("Validation is only supported for the automatic-speech-recognition task.")
+    else:
+        main()
