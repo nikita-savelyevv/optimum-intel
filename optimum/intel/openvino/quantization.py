@@ -1896,8 +1896,9 @@ class OVQuantizer(OptimumQuantizer):
                         submodel, config, nncf_dataset, backend_params=backend_params, **kwargs
                     )
                 else:
-                    # TODO add advanced params
-                    quantized_model = _mixed_quantization(submodel, config, nncf_dataset, **kwargs)
+                    quantized_model = _mixed_quantization(
+                        submodel, config, nncf_dataset, backend_params=backend_params, **kwargs
+                    )
             else:
                 raise ValueError(f"Unsupported type of quantization config: {type(config)}.")
 
@@ -2080,16 +2081,15 @@ class OVQuantizer(OptimumQuantizer):
                     # Apply hybrid quantization to diffusion model
                     diffusion_model_name = next(iter(calibration_dataset))
 
-                    # TODO: implement proper creation of hybrid mixed quantization config for onnx case
-                    # diffusion_model = getattr(self.model, diffusion_model_name).model
-                    # quantization_configs[diffusion_model_name] = _get_hybrid_mixed_quantization_config(
-                    #     diffusion_model, quantization_config, **kwargs
-                    # )
-                    quantization_configs[diffusion_model_name] = OVQuantizationConfig(
-                        num_samples=quantization_config.num_samples or 200,
-                        smooth_quant_alpha=-1,
-                        **kwargs,
+                    diffusion_model = getattr(self.model, diffusion_model_name)
+                    quantization_configs[diffusion_model_name] = _get_hybrid_mixed_quantization_config(
+                        diffusion_model, quantization_config, **kwargs
                     )
+                    # quantization_configs[diffusion_model_name] = OVQuantizationConfig(
+                    #     num_samples=quantization_config.num_samples or 200,
+                    #     smooth_quant_alpha=-1,
+                    #     **kwargs,
+                    # )
 
                     # Apply weight-only quantization to all SD submodels except UNet/Transformer
                     quantization_config_copy = quantization_config.clone()
@@ -2378,7 +2378,7 @@ def _get_operation_const_op(operation, const_port_id: int):
 
 
 def _is_embedding(node) -> bool:
-    allowed_types_list = ["f16", "f32", "f64"]
+    allowed_types_list = ["bf16", "f16", "f32", "f64"]
     const_port_id = 0
     input_tensor = node.input_value(const_port_id)
     if input_tensor.get_element_type().get_type_name() in allowed_types_list:
@@ -2389,7 +2389,7 @@ def _is_embedding(node) -> bool:
     return False
 
 
-def _collect_ops_with_weights(model):
+def _collect_ops_with_weights_ov(model):
     ops_with_weights = []
     for op in model.get_ops():
         if op.get_type_name() == "MatMul":
@@ -2399,6 +2399,127 @@ def _collect_ops_with_weights(model):
                 ops_with_weights.append(op.get_friendly_name())
         if op.get_type_name() == "Gather" and _is_embedding(op):
             ops_with_weights.append(op.get_friendly_name())
+
+    return ops_with_weights
+
+
+def _collect_ops_with_weights_onnx(model: onnx.ModelProto):
+    """
+    Return names of ops that have constant weights:
+      - MatMul or Gemm with at least one const/initializer input (after
+        walking through Cast/Reshape/Q/DQ/etc.)
+      - Gather used as embedding (const float weights on input[0])
+    """
+
+    FLOAT_DTYPES = {
+        onnx.TensorProto.FLOAT16,  # f16
+        onnx.TensorProto.FLOAT,  # f32
+        onnx.TensorProto.DOUBLE,  # f64
+        onnx.TensorProto.BFLOAT16,  # (optional) bf16 if you want to treat as weight too
+    }
+
+    def _build_graph_indices(model: onnx.ModelProto):
+        """
+        Returns:
+          init_by_name: {tensor_name -> TensorProto (initializer)}
+          producer:     {tensor_name -> NodeProto that produces it}
+        """
+        g = model.graph
+        init_by_name = {t.name: t for t in g.initializer}
+        producer = {}
+        for n in g.node:
+            for out in n.output:
+                if out:  # non-empty
+                    producer[out] = n
+        return init_by_name, producer
+
+    def _const_tensor_from_constant_node(n: onnx.NodeProto):
+        """Extract TensorProto from an ONNX Constant node (if present)."""
+        if n.op_type != "Constant":
+            return None
+        for a in n.attribute:
+            if a.type == onnx.AttributeProto.TENSOR and a.name in ("value", ""):
+                return a.t
+        return None  # Some Constant variants (rare) may not carry 'value' tensor.
+
+    def _resolve_to_constant_tensor(model: onnx.ModelProto, tensor_name: str):
+        """
+        Starting from an input tensor name, walk upstream across harmless ops
+        (data input 0) until we hit an Initializer or Constant. Return TensorProto
+        if found, else None.
+        """
+        init_by_name, producer = _build_graph_indices(model)
+
+        allowed = {
+            "Cast",
+            "Reshape",
+            "Squeeze",
+            "Unsqueeze",
+            "Identity",
+            "QuantizeLinear",
+            "DequantizeLinear",
+            "Transpose",  # often used on weight matrices
+        }
+
+        queue = deque([tensor_name])
+        while queue:
+            tname = queue.popleft()
+
+            # Initializer = definite constant
+            if tname in init_by_name:
+                return init_by_name[tname]
+
+            # Otherwise see who produces this tensor
+            n = producer.get(tname)
+            if n is None:
+                # No producer: graph input / unknown; stop.
+                return None
+
+            if n.op_type == "Constant":
+                t = _const_tensor_from_constant_node(n)
+                return t
+
+            if n.op_type in allowed:
+                # Follow the DATA input (port 0) just like in your OV code
+                if len(n.input) >= 1 and n.input[0]:
+                    queue.append(n.input[0])
+                else:
+                    return None
+            else:
+                return None
+
+        return None
+
+    def _is_embedding_onnx(model: onnx.ModelProto, node: onnx.NodeProto) -> bool:
+        """
+        In ONNX, embeddings are typically Gather with float weights on input[0].
+        """
+        if node.op_type != "Gather":
+            return False
+        if not node.input or not node.input[0]:
+            return False
+
+        t = _resolve_to_constant_tensor(model, node.input[0])
+        return bool(t and t.data_type in FLOAT_DTYPES)
+
+    def _stable_node_name(node: onnx.NodeProto, idx: int) -> str:
+        """ONNX nodes may have empty .name; fallback to first output or typed index."""
+        return node.name or (node.output[0] if node.output else f"{node.op_type}:{idx}")
+
+    ops_with_weights = []
+    for i, n in enumerate(model.graph.node):
+        if n.op_type in ("MatMul", "Gemm"):
+            c0 = _resolve_to_constant_tensor(model, n.input[0]) if len(n.input) > 0 else None
+            c1 = _resolve_to_constant_tensor(model, n.input[1]) if len(n.input) > 1 else None
+            # accept any float-ish constant as a weight
+            has_const = (c0 is not None and c0.data_type in FLOAT_DTYPES) or (
+                c1 is not None and c1.data_type in FLOAT_DTYPES
+            )
+            if has_const:
+                ops_with_weights.append(_stable_node_name(n, i))
+
+        elif n.op_type == "Gather" and _is_embedding_onnx(model, n):
+            ops_with_weights.append(_stable_node_name(n, i))
 
     return ops_with_weights
 
@@ -2426,10 +2547,39 @@ def _get_hybrid_mixed_quantization_config(
 
     wc_config = quantization_config.clone()
     wc_config.ignored_scope = {}
-    if any(op.get_type_name() == "Convolution" for op in model.get_ops()):
-        wc_config.ignored_scope["types"] = ["Convolution"]
 
-    q_config_ignored_scope = {"names": _collect_ops_with_weights(model)}
+    from optimum.onnxruntime.base import ORTSessionMixin
+
+    if isinstance(model, ORTSessionMixin):
+
+        def _iter_onnx_nodes(model: onnx.ModelProto):
+            stack = [model.graph]
+            while stack:
+                g = stack.pop()
+                for n in g.node:
+                    yield n
+                    for a in n.attribute:
+                        if a.type == onnx.AttributeProto.GRAPH and a.g:
+                            stack.append(a.g)
+                        elif a.type == onnx.AttributeProto.GRAPHS and a.graphs:
+                            stack.extend(a.graphs)
+
+        def _has_conv_onnx(model: onnx.ModelProto) -> bool:
+            return any(n.op_type == "Conv" for n in _iter_onnx_nodes(model))
+
+        load_external_data = not Path(model.path).with_suffix(".onnx_data").exists()
+        model_proto = onnx.load(model.path, load_external_data=load_external_data)
+        if _has_conv_onnx(model_proto):
+            wc_config.ignored_scope["types"] = ["Conv"]
+        ops_with_weights = _collect_ops_with_weights_onnx(model_proto)
+    elif isinstance(model, openvino.Model):
+        if any(op.get_type_name() == "Convolution" for op in model.get_ops()):
+            wc_config.ignored_scope["types"] = ["Convolution"]
+        ops_with_weights = _collect_ops_with_weights_ov(model)
+    else:
+        raise ValueError(f"Unsupported model type {type(model)}")
+
+    q_config_ignored_scope = {"names": ops_with_weights}
     q_config = OVQuantizationConfig(
         ignored_scope=q_config_ignored_scope,
         num_samples=quantization_config.num_samples or 200,
@@ -2451,6 +2601,7 @@ def _mixed_quantization(
     model: openvino.Model,
     quantization_config: OVMixedQuantizationConfig,
     dataset: nncf.Dataset,
+    backend_params: Optional[Dict[str, Any]] = None,
     **kwargs,
 ) -> openvino.Model:
     """
@@ -2489,11 +2640,18 @@ def _mixed_quantization(
     wc_config = quantization_config.weight_quantization_config.clone()
     wc_config.ignored_scope = merge_ignored_scopes(wc_config.ignored_scope, quantization_config.ignored_scope)
     wc_dataset = dataset if wc_config.bits != 8 else None
-    compressed_model = _weight_only_quantization(model, wc_config, wc_dataset, **kwargs)
+    compressed_model = _weight_only_quantization(model, wc_config, wc_dataset, backend_params=backend_params, **kwargs)
+
+    if isinstance(compressed_model, onnx.ModelProto):
+        model_path = os.path.join(backend_params[BackendParameters.EXTERNAL_DATA_DIR], "model.onnx")
+        onnx.save(compressed_model, model_path, save_as_external_data=True)
+        compressed_model = onnx.load(model_path, load_external_data=False)
 
     q_config = quantization_config.full_quantization_config.clone()
     q_config.ignored_scope = merge_ignored_scopes(q_config.ignored_scope, quantization_config.ignored_scope)
-    quantized_model = _full_quantization(compressed_model, q_config, dataset, verify_not_optimized=False, **kwargs)
+    quantized_model = _full_quantization(
+        compressed_model, q_config, dataset, backend_params=backend_params, verify_not_optimized=False, **kwargs
+    )
 
     return quantized_model
 

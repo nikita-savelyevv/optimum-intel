@@ -14,10 +14,13 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 from datasets import load_dataset
+from jiwer import wer, wer_standardize
+from torchmetrics.image.inception import InceptionScore
+from torchvision import transforms as transforms
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer, set_seed
-from jiwer import wer, wer_standardize
 
 from optimum.intel import (
     OVConfig,
@@ -48,10 +51,19 @@ def extract_input_features(processor, sample):
 
 
 parser = argparse.ArgumentParser(description="Run model quantization and inference.")
-parser.add_argument("--task", type=str, choices=["text-generation", "text-to-image", "automatic-speech-recognition"], help="Task to perform.")
+parser.add_argument(
+    "--task",
+    type=str,
+    choices=["text-generation", "text-to-image", "automatic-speech-recognition"],
+    help="Task to perform.",
+)
 parser.add_argument("--apply-quantization", action="store_true", help="Apply quantization to the model.")
-parser.add_argument("--export-backend", type=str, default="onnx", choices=["onnx", "openvino"], help="Export backend to use.")
-parser.add_argument("--inference-backend", type=str, default="openvino", choices=["onnx", "openvino"], help="Inference backend to use.")
+parser.add_argument(
+    "--export-backend", type=str, default="onnx", choices=["onnx", "openvino"], help="Export backend to use."
+)
+parser.add_argument(
+    "--inference-backend", type=str, default="openvino", choices=["onnx", "openvino"], help="Inference backend to use."
+)
 parser.add_argument("--n-iter", type=int, default=1, help="Number of iterations for inference.")
 parser.add_argument("--validate", action="store_true", help="Validate instead of exporting")
 args = parser.parse_args()
@@ -84,7 +96,7 @@ elif args.task == "text-to-image":
     )
 elif args.task == "automatic-speech-recognition":
     ort_model_cls, ov_model_cls = ORTModelForSpeechSeq2Seq, OVModelForSpeechSeq2Seq
-    model_id = "openai/whisper-large-v3"
+    model_id = "openai/whisper-medium"
     quantization_config = OVQuantizationConfig(dataset="librispeech", processor=model_id, num_samples=32)
 else:
     raise ValueError(f"Unsupported args.task: {args.task}")
@@ -103,6 +115,8 @@ def main():
     model_kwargs = {}
     if args.export_backend == "openvino":
         model_kwargs["load_in_8bit"] = False
+        if args.task == "automatic-speech-recognition":
+            model_kwargs["stateful"] = False
     model = export_cls.from_pretrained(model_id, export=True, **model_kwargs)
     if args.apply_quantization:
         OVQuantizer(model).quantize(
@@ -114,7 +128,7 @@ def main():
         AutoTokenizer.from_pretrained(model_id).save_pretrained(output_dir)
     elif args.task == "automatic-speech-recognition":
         AutoProcessor.from_pretrained(model_id).save_pretrained(output_dir)
-    
+
     #
     # Run inference
     #
@@ -131,7 +145,7 @@ def main():
         for _ in range(args.n_iter):
             set_seed(0)
             start_t = time.time()
-            output = ov_model.generate(input_ids, max_new_tokens=100, eos_token_id=-1)     # Fix number of output tokens
+            output = ov_model.generate(input_ids, max_new_tokens=100, eos_token_id=-1)  # Fix number of output tokens
             times.append(time.time() - start_t)
         elapsed_time = f"Average elapsed time over {args.n_iter} iterations: {np.mean(times):.2f} seconds"
         print(elapsed_time)
@@ -168,7 +182,7 @@ def main():
         for _ in range(args.n_iter):
             set_seed(0)
             start_t = time.time()
-            images = ov_model(prompt, num_inference_steps=50, guidance_scale=7.5).images
+            images = ov_model(prompt).images
             times.append(time.time() - start_t)
         elapsed_time = f"Average elapsed time over {args.n_iter} iterations: {np.mean(times):.2f} seconds"
         print(elapsed_time)
@@ -200,15 +214,21 @@ def validate_whisper(test_dataset_size):
 
             ground_truths.append(data_item["text"])
             predictions.append(transcription[0])
-            print(f"Ground truth: {data_item['text']}")
-            print(f"Prediction: {transcription[0]}")
+            # print(f"Ground truth: {data_item['text']}")
+            # print(f"Prediction: {transcription[0]}")
 
-        word_accuracy = (1 - wer(ground_truths, predictions, reference_transform=wer_standardize,
-                                 hypothesis_transform=wer_standardize)) * 100
-        mean_infer_time = sum(infer_times)
+        word_accuracy = (
+            1
+            - wer(
+                ground_truths, predictions, reference_transform=wer_standardize, hypothesis_transform=wer_standardize
+            )
+        ) * 100
+        mean_infer_time = sum(infer_times) / len(infer_times)
         return word_accuracy, mean_infer_time
 
-    test_dataset = load_dataset("openslr/librispeech_asr", "clean", split="test", streaming=True, trust_remote_code=True)
+    test_dataset = load_dataset(
+        "openslr/librispeech_asr", "clean", split="test", streaming=True, trust_remote_code=True
+    )
     test_dataset = test_dataset.shuffle(seed=0).take(test_dataset_size)
     test_samples = [sample for sample in test_dataset]
 
@@ -217,16 +237,61 @@ def validate_whisper(test_dataset_size):
     accuracy, mean_infer_time = calculate_transcription_time_and_accuracy(model, test_samples)
     print(f"Word accuracy: {accuracy:.2f}%")
     print(f"Average inference time: {mean_infer_time:.4f} seconds")
-    with open(output_dir / f"validation.txt", "w") as f:
+    with open(output_dir / "validation.txt", "w") as f:
         f.write(f"Word accuracy: {accuracy:.2f}%\n")
         f.write(f"Average inference time: {mean_infer_time:.4f} seconds\n")
+
+
+def validate_text_to_image(test_dataset_size, batch_size=100):
+    dataset = load_dataset(
+        "google-research-datasets/conceptual_captions", "unlabeled", split="validation", trust_remote_code=True
+    ).shuffle(seed=42)
+    dataset = dataset.take(test_dataset_size)
+    inception_score = InceptionScore(normalize=True, splits=1)
+
+    # model = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
+    # output_dir = Path("/home/nsavel/workspace/optimum-intel/ort_quantized_models/stable-diffusion-2-1/torch_scheduler")
+    model = inference_cls.from_pretrained(output_dir, from_onnx=args.export_backend == "onnx")
+    # model.scheduler = DPMSolverMultistepScheduler.from_config(model.scheduler.config)
+
+    images_save_dir = output_dir / "validation_images"
+    images = []
+    infer_times = []
+    for batch in tqdm(dataset, desc="Computing Inception Score"):
+        prompt = batch["caption"]
+        if len(prompt) > model.tokenizer.model_max_length:
+            continue
+        start_time = time.perf_counter()
+        image = model(prompt).images[0]
+        images_save_dir.mkdir(parents=True, exist_ok=True)
+        image.save(images_save_dir / f"{prompt[:50].replace(' ', '_').replace('/', '_')}.png")
+        infer_times.append(time.perf_counter() - start_time)
+        image = transforms.ToTensor()(image)
+        images.append(image)
+    mean_perf_time = sum(infer_times) / len(infer_times)
+
+    while len(images) > 0:
+        images_batch = torch.stack(images[-batch_size:])
+        images = images[:-batch_size]
+        inception_score.update(images_batch)
+    kl_mean, kl_std = inception_score.compute()
+
+    print(f"KL divergence: {kl_mean:.4f}")
+    print(f"Average inference time: {mean_perf_time:.4f} seconds")
+    with open(output_dir / "validation.txt", "w") as f:
+        f.write(f"KL divergence: {kl_mean:.4f}\n")
+        f.write(f"Average inference time: {mean_perf_time:.4f} seconds\n")
 
 
 if __name__ == "__main__":
     if args.validate:
         if args.task == "automatic-speech-recognition":
             validate_whisper(test_dataset_size=args.n_iter)
+        elif args.task == "text-to-image":
+            validate_text_to_image(test_dataset_size=args.n_iter)
         else:
-            raise ValueError("Validation is only supported for the automatic-speech-recognition task.")
+            raise ValueError(
+                "Validation is only supported for the automatic-speech-recognition and text-to-image tasks."
+            )
     else:
         main()
