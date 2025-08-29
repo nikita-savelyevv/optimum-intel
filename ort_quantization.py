@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import nncf
 import numpy as np
 import torch
 from PIL import Image
@@ -101,6 +102,10 @@ elif args.task == "automatic-speech-recognition":
     ort_model_cls, ov_model_cls = ORTModelForSpeechSeq2Seq, OVModelForSpeechSeq2Seq
     model_id = "openai/whisper-medium"
     quantization_config = OVQuantizationConfig(dataset="librispeech", processor=model_id, num_samples=32)
+    # quantization_config = OVQuantizationConfig(
+    #     dataset="librispeech", processor=model_id, num_samples=32, smooth_quant_alpha=-1, fast_bias_correction=False,
+    #     advanced_parameters=nncf.AdvancedQuantizationParameters(disable_bias_correction=True)
+    # )
 else:
     raise ValueError(f"Unsupported args.task: {args.task}")
 
