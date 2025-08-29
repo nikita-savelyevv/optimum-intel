@@ -12,13 +12,16 @@
 import argparse
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
+from PIL import Image
 from datasets import load_dataset
 from jiwer import wer, wer_standardize
-from torchmetrics.image.inception import InceptionScore
-from torchvision import transforms as transforms
+import torchvision.transforms as T
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.multimodal import CLIPScore
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer, set_seed
 
@@ -242,44 +245,138 @@ def validate_whisper(test_dataset_size):
         f.write(f"Average inference time: {mean_infer_time:.4f} seconds\n")
 
 
-def validate_text_to_image(test_dataset_size, batch_size=100):
+def validate_text_to_image(
+    test_dataset_size: int,
+    batch_size: int = 64,
+    real_images_dir: Optional[str] = None,    # folder with *real* images for FID (optional)
+    clip_model_name_or_path: str = "openai/clip-vit-base-patch16",  # per torchmetrics docs
+):
+    """
+    Evaluates a text-to-image model with:
+      - CLIPScore (torchmetrics) — semantic text↔image alignment (higher is better)
+      - (optional) FID (torchmetrics) vs. a directory of real images (lower is better)
+
+    Notes:
+      - Requires globals present in your env: `inference_cls`, `output_dir`, `args` (with .export_backend)
+      - Saves generated images into <output_dir>/validation_images
+    """
+
+    def _image_paths_in_dir(root: str):
+        exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+        root = Path(root)
+        return [str(p) for p in sorted(root.rglob("*")) if p.suffix.lower() in exts]
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ----- Dataset with prompts -----
     dataset = load_dataset(
-        "google-research-datasets/conceptual_captions", "unlabeled", split="validation", trust_remote_code=True
+        "google-research-datasets/conceptual_captions",
+        "unlabeled",
+        split="validation",
+        trust_remote_code=True,
     ).shuffle(seed=42)
     dataset = dataset.take(test_dataset_size)
-    inception_score = InceptionScore(normalize=True, splits=1)
 
-    # model = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
-    # output_dir = Path("/home/nsavel/workspace/optimum-intel/ort_quantized_models/stable-diffusion-2-1/torch_scheduler")
+    # ----- Your model under test -----
     model = inference_cls.from_pretrained(output_dir, from_onnx=args.export_backend == "onnx")
-    # model.scheduler = DPMSolverMultistepScheduler.from_config(model.scheduler.config)
 
-    images_save_dir = output_dir / "validation_images"
-    images = []
+    # ----- Output paths -----
+    images_save_dir = Path(output_dir) / "validation_images"
+    images_save_dir.mkdir(parents=True, exist_ok=True)
+
+    # ----- Generation loop -----
+    prompts = []
+    gen_tensors = []   # store as CHW float in [0,1] for metrics
     infer_times = []
-    for batch in tqdm(dataset, desc="Computing Inception Score"):
-        prompt = batch["caption"]
-        if len(prompt) > model.tokenizer.model_max_length:
-            continue
-        start_time = time.perf_counter()
-        image = model(prompt).images[0]
-        images_save_dir.mkdir(parents=True, exist_ok=True)
-        image.save(images_save_dir / f"{prompt[:50].replace(' ', '_').replace('/', '_')}.png")
-        infer_times.append(time.perf_counter() - start_time)
-        image = transforms.ToTensor()(image)
-        images.append(image)
+
+    to_tensor = T.ToTensor()  # PIL -> float tensor in [0,1]
+
+    print("Generating images...")
+    for row in tqdm(dataset, desc="Generation"):
+        prompt = row["caption"]
+
+        # Skip overly long prompts if your tokenizer has limits
+        if hasattr(model, "tokenizer"):
+            max_len = getattr(model.tokenizer, "model_max_length", None)
+            if max_len is not None and len(prompt) > max_len:
+                continue
+
+        start = time.perf_counter()
+        pil_img = model(prompt).images[0]  # PIL.Image
+        infer_times.append(time.perf_counter() - start)
+
+        # Save image
+        safe_name = prompt[:80].replace(" ", "_").replace("/", "_")
+        out_path = images_save_dir / f"{safe_name}.png"
+        pil_img.save(out_path)
+
+        # Keep for metrics
+        prompts.append(prompt)
+        gen_tensors.append(to_tensor(pil_img))  # CHW, float32 in [0,1]
+
+    if len(gen_tensors) == 0:
+        raise RuntimeError("No images were generated (all prompts filtered out?).")
+
     mean_perf_time = sum(infer_times) / len(infer_times)
 
-    while len(images) > 0:
-        images_batch = torch.stack(images[-batch_size:])
-        images = images[:-batch_size]
-        inception_score.update(images_batch)
-    kl_mean, kl_std = inception_score.compute()
+    # ----- CLIPScore (torchmetrics) -----
+    # This downloads/loads the CLIP model internally and computes the *average* score.
+    clip_metric = CLIPScore(model_name_or_path=clip_model_name_or_path).to(device)
+    clip_metric.reset()
 
-    print(f"KL divergence: {kl_mean:.4f}")
+    print("Computing CLIPScore (torchmetrics)...")
+    for i in range(0, len(gen_tensors), batch_size):
+        imgs = torch.stack(gen_tensors[i : i + batch_size]).to(device)   # [B,3,H,W], float in [0,1]
+        txts = prompts[i : i + batch_size]                               # List[str]
+        clip_metric.update(imgs, txts)
+
+    clip_score = float(clip_metric.compute().item())  # scalar average (higher is better)
+
+    # ----- (Optional) FID (torchmetrics) -----
+    fid_score = None
+    if real_images_dir is not None:
+        real_paths = _image_paths_in_dir(real_images_dir)
+        if len(real_paths) == 0:
+            print(f"[WARN] No images found in real_images_dir: {real_images_dir}. Skipping FID.")
+        else:
+            print(f"Computing FID vs. {real_images_dir} (torchmetrics, size-agnostic)...")
+            # normalize=True -> inputs in [0,1] float
+            fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+            fid_metric.reset()
+
+            to_tensor = T.ToTensor()  # PIL -> float in [0,1], shape [3,H,W]
+
+            # --- Update REAL distribution, one-by-one (any HxW works) ---
+            for rp in tqdm(real_paths, desc="FID: real (streaming)"):
+                try:
+                    real_img = Image.open(rp).convert("RGB")
+                except Exception:
+                    continue
+                rb = to_tensor(real_img).unsqueeze(0).to(device)  # [1,3,H,W]
+                fid_metric.update(rb, real=True)
+
+            # --- Update FAKE (generated) distribution, also one-by-one to be size-agnostic ---
+            for gt in tqdm(gen_tensors, desc="FID: fake (streaming)"):
+                gb = gt.unsqueeze(0).to(device)  # [1,3,H,W]
+                fid_metric.update(gb, real=False)
+
+            fid_score = float(fid_metric.compute().item())
+
+    # ----- Report -----
+    print(f"CLIPScore (avg): {clip_score:.4f}")
+    if fid_score is not None:
+        print(f"FID: {fid_score:.2f}  (lower is better)")
+    else:
+        print("FID: skipped (no real_images_dir provided)")
     print(f"Average inference time: {mean_perf_time:.4f} seconds")
-    with open(output_dir / "validation.txt", "w") as f:
-        f.write(f"KL divergence: {kl_mean:.4f}\n")
+
+    # ----- Persist to file -----
+    with open(Path(output_dir) / "validation.txt", "w", encoding="utf-8") as f:
+        f.write(f"CLIPScore (avg): {clip_score:.4f}\n")
+        if fid_score is not None:
+            f.write(f"FID: {fid_score:.2f}\n")
+        else:
+            f.write("FID: skipped (no real_images_dir provided)\n")
         f.write(f"Average inference time: {mean_perf_time:.4f} seconds\n")
 
 
@@ -288,7 +385,10 @@ if __name__ == "__main__":
         if args.task == "automatic-speech-recognition":
             validate_whisper(test_dataset_size=args.n_iter)
         elif args.task == "text-to-image":
-            validate_text_to_image(test_dataset_size=args.n_iter)
+            validate_text_to_image(
+                test_dataset_size=args.n_iter,
+                real_images_dir="/media/hdd1/datasets/coco/images/val2017"
+            )
         else:
             raise ValueError(
                 "Validation is only supported for the automatic-speech-recognition and text-to-image tasks."
