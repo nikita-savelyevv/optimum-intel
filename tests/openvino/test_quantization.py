@@ -1474,7 +1474,7 @@ class OVWeightCompressionTest(unittest.TestCase):
 class OVPipelineQuantizationTest(unittest.TestCase):
     maxDiff = None
 
-    PIPELINE_QUANTIZATION_CONFIGURATIONS = [
+    PIPELINE_QUANTIZATION_SCOPE = [
         (
             OVModelForCausalLM,
             "gpt2",
@@ -1640,92 +1640,69 @@ class OVPipelineQuantizationTest(unittest.TestCase):
                 "vision_embeddings_model": {"int8": 11},
             },
         ),
-        (
-            OVModelForVisualCausalLM,
-            "phi4mm",
-            True,
-            dict(
-                quantization_configs={
-                    "lm_model": dict(
-                        bits=4,
-                        group_size=16,
-                        dataset="contextual",
-                        num_samples=1,
-                        ratio=0.8,
-                        sensitivity_metric="mean_activation_magnitude",
-                        quant_method=OVQuantizationMethod.AWQ,
-                        scale_estimation=True,
-                        lora_correction=True,
-                        ignored_scope={
-                            "patterns": [
-                                "__module\\.model\\.layers\\.\\d+\\.(mlp\\.(gate_up_proj|down_proj)|self_attn\\.(qkv_proj|o_proj))"
-                                + (
-                                    "/aten::mul/Multiply"
-                                    if is_openvino_version("<", "2025.2")
-                                    else "\\.lora_B\\.speech/aten::linear/MatMul"
-                                ),
-                            ],
-                        },
-                    ),
-                    "text_embeddings_model": dict(bits=8, sym=True, weight_only=True),
-                    "audio_encoder_model": dict(bits=8, sym=True, weight_only=True),
-                    "vision_embeddings_model": dict(bits=8, sym=True, weight_only=True),
-                },
-                trust_remote_code=True,
-            ),
-            {
-                "lm_model": 0,
-                "text_embeddings_model": 0,
-                "audio_encoder_model": 0,
-                "vision_embeddings_model": 0,
-                "vision_projection_model": 0,
-                "audio_embeddings_model": 0,
-                "audio_forward_embeddings_model": 0,
-                "audio_vision_projection_model": 0,
-                "audio_speech_projection_model": 0,
-            },
-            {
-                "lm_model": {"int8": 60, "int4": 26},
-                "text_embeddings_model": {"int8": 1},
-                "audio_encoder_model": {"int8": 25},
-                "vision_embeddings_model": {"int8": 8},
-                "vision_projection_model": {},
-                "audio_embeddings_model": {},
-                "audio_forward_embeddings_model": {},
-                "audio_vision_projection_model": {},
-                "audio_speech_projection_model": {},
-            },
-        ),
-        (
-            OVModelForCausalLM,
-            "gpt_oss_mxfp4",
-            False,
-            dict(
-                quantization_configs={
-                    "model": dict(
-                        quantization_configs=[
-                            dict(
-                                bits=4,
-                                group_size=8,
-                                ignored_scope=dict(patterns=[".*self_attn.*", ".*router.*"]),
-                            ),
-                            dict(
-                                weight_only=True,
-                            ),
-                        ]
-                    )
-                }
-            ),
-            {"model": 0},
-            {"model": {"int8": 22, "int4": 8}},
-        ),
     ]
 
-    PIPELINE_QUANTIZATION_SCOPE = [
-        config
-        for config in PIPELINE_QUANTIZATION_CONFIGURATIONS
-        if TEST_NAME_TO_MODEL_TYPE.get(config[1], config[1]) in get_supported_model_for_library("transformers")
-    ]
+    if is_transformers_version(">=", "4.49.0") and is_transformers_version("<", "4.54.0"):
+        PIPELINE_QUANTIZATION_SCOPE.extend(
+            [
+                (
+                    OVModelForVisualCausalLM,
+                    "phi4mm",
+                    True,
+                    dict(
+                        quantization_configs={
+                            "lm_model": dict(
+                                bits=4,
+                                group_size=16,
+                                dataset="contextual",
+                                num_samples=1,
+                                ratio=0.8,
+                                sensitivity_metric="mean_activation_magnitude",
+                                quant_method=OVQuantizationMethod.AWQ,
+                                scale_estimation=True,
+                                lora_correction=True,
+                                ignored_scope={
+                                    "patterns": [
+                                        "__module\\.model\\.layers\\.\\d+\\.(mlp\\.(gate_up_proj|down_proj)|self_attn\\.(qkv_proj|o_proj))"
+                                        + (
+                                            "/aten::mul/Multiply"
+                                            if is_openvino_version("<", "2025.2")
+                                            else "\\.lora_B\\.speech/aten::linear/MatMul"
+                                        ),
+                                    ],
+                                },
+                            ),
+                            "text_embeddings_model": dict(bits=8, sym=True, weight_only=True),
+                            "audio_encoder_model": dict(bits=8, sym=True, weight_only=True),
+                            "vision_embeddings_model": dict(bits=8, sym=True, weight_only=True),
+                        },
+                        trust_remote_code=True,
+                    ),
+                    {
+                        "lm_model": 0,
+                        "text_embeddings_model": 0,
+                        "audio_encoder_model": 0,
+                        "vision_embeddings_model": 0,
+                        "vision_projection_model": 0,
+                        "audio_embeddings_model": 0,
+                        "audio_forward_embeddings_model": 0,
+                        "audio_vision_projection_model": 0,
+                        "audio_speech_projection_model": 0,
+                    },
+                    {
+                        "lm_model": {"int8": 60, "int4": 26},
+                        "text_embeddings_model": {"int8": 1},
+                        "audio_encoder_model": {"int8": 25},
+                        "vision_embeddings_model": {"int8": 8},
+                        "vision_projection_model": {},
+                        "audio_embeddings_model": {},
+                        "audio_forward_embeddings_model": {},
+                        "audio_vision_projection_model": {},
+                        "audio_speech_projection_model": {},
+                    },
+                ),
+            ]
+        )
 
     @parameterized.expand(PIPELINE_QUANTIZATION_SCOPE)
     def test_ovmodel_pipeline_quantization(
@@ -1950,18 +1927,13 @@ class OVQuantizationConfigTest(unittest.TestCase):
                     OVQuantizationConfig(
                         bits=8,
                         dataset="wikitext2",
-                        ignored_scope={"patterns": ["pattern1"]},
                     ),
                     OVWeightQuantizationConfig(bits=4, group_size=16),
                     OVMixedQuantizationConfig(
-                        weight_quantization_config=OVWeightQuantizationConfig(
-                            bits=4, dtype="nf4", ignored_scope={"patterns": ["pattern2"], "names": ["name1"]}
-                        ),
+                        weight_quantization_config=OVWeightQuantizationConfig(bits=4, dtype="nf4"),
                         full_quantization_config=OVQuantizationConfig(dtype="f8e4m3", dataset="wikitext2"),
-                        ignored_scope={"patterns": ["pattern3"], "names": ["name2"]},
                     ),
                 ],
-                ignored_scope={"patterns": ["pattern2"], "names": ["name2"]},
             ),
         ),
     )
