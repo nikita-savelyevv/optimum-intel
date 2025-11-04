@@ -282,6 +282,8 @@ class OVWeightQuantizationConfig(OVQuantizationConfigBase):
         self.sensitivity_metric = sensitivity_metric
         self.quant_method = OVQuantizationMethod(quant_method) if isinstance(quant_method, str) else quant_method
         self.scale_estimation = scale_estimation
+        # Store extra kwargs for validation
+        self._extra_kwargs = kwargs
         self.post_init()
 
     def post_init(self):
@@ -326,6 +328,17 @@ class OVWeightQuantizationConfig(OVQuantizationConfigBase):
 
         if self.tokenizer is not None and not isinstance(self.tokenizer, str):
             raise ValueError(f"Tokenizer is expected to be a string, but found {self.tokenizer}")
+
+        # Security: Check for potentially dangerous parameters in config
+        # These parameters should never be set via remote config files
+        dangerous_params = ["trust_remote_code", "code_revision", "use_auth_token", "token"]
+        if hasattr(self, "_extra_kwargs") and self._extra_kwargs:
+            found_dangerous = [param for param in dangerous_params if param in self._extra_kwargs]
+            if found_dangerous:
+                raise ValueError(
+                    f"Security: The following parameters cannot be set via quantization config: {found_dangerous}. "
+                    "These parameters must be set explicitly when calling quantization methods."
+                )
 
 
 @dataclass

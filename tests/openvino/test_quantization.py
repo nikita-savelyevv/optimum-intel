@@ -927,3 +927,54 @@ class InferRequestWrapperTest(unittest.TestCase):
         else:
             # Without caching, encoder hidden states tensors will be unique for each collected input
             self.assertGreater(len(data_id_per_key["encoder_hidden_states"]), 2)
+
+
+class OVQuantizationSecurityTest(unittest.TestCase):
+    """Tests for security fixes related to remote code execution vulnerabilities"""
+
+    def test_config_rejects_trust_remote_code(self):
+        """Test that quantization config rejects trust_remote_code parameter"""
+        with self.assertRaises(ValueError) as context:
+            OVWeightQuantizationConfig(
+                bits=8,
+                tokenizer="some/model",
+                trust_remote_code=True,
+            )
+        self.assertIn("trust_remote_code", str(context.exception))
+        self.assertIn("Security", str(context.exception))
+
+    def test_config_rejects_dangerous_params(self):
+        """Test that quantization config rejects other dangerous parameters"""
+        dangerous_params = ["code_revision", "use_auth_token", "token"]
+        for param in dangerous_params:
+            with self.subTest(param=param):
+                with self.assertRaises(ValueError) as context:
+                    OVWeightQuantizationConfig(bits=8, tokenizer="some/model", **{param: "malicious_value"})
+                self.assertIn(param, str(context.exception))
+                self.assertIn("Security", str(context.exception))
+
+    def test_config_from_dict_rejects_trust_remote_code(self):
+        """Test that config loaded from dict rejects trust_remote_code"""
+        config_dict = {
+            "bits": 8,
+            "tokenizer": "some/model",
+            "trust_remote_code": True,
+        }
+        with self.assertRaises(ValueError) as context:
+            OVWeightQuantizationConfig.from_dict(config_dict)
+        self.assertIn("trust_remote_code", str(context.exception))
+        self.assertIn("Security", str(context.exception))
+
+    def test_config_allows_safe_parameters(self):
+        """Test that config accepts safe parameters normally"""
+        # This should not raise any errors
+        config = OVWeightQuantizationConfig(
+            bits=8,
+            sym=False,
+            tokenizer="gpt2",
+            dataset="wikitext2",
+            ratio=0.8,
+        )
+        self.assertEqual(config.bits, 8)
+        self.assertEqual(config.tokenizer, "gpt2")
+        self.assertFalse(config.sym)

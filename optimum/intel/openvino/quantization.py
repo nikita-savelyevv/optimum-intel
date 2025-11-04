@@ -672,7 +672,8 @@ class OVQuantizer(OptimumQuantizer):
     def _prepare_builtin_dataset(self, quantization_config: OVWeightQuantizationConfig):
         from optimum.gptq.data import get_dataset, prepare_dataset
 
-        tokenizer = AutoTokenizer.from_pretrained(quantization_config.tokenizer)
+        # Security: Always set trust_remote_code=False when loading tokenizer from config to prevent RCE
+        tokenizer = AutoTokenizer.from_pretrained(quantization_config.tokenizer, trust_remote_code=False)
         nsamples = quantization_config.num_samples if quantization_config.num_samples else 128
         calibration_dataset = get_dataset(quantization_config.dataset, tokenizer, seqlen=32, nsamples=nsamples)
         calibration_dataset = prepare_dataset(calibration_dataset)
