@@ -137,7 +137,8 @@ def maybe_convert_tokenizer_to_fast(
 
     if isinstance(hf_tokenizer, NEED_CONVERT_TO_FAST_TOKENIZER):
         try:
-            return AutoTokenizer.from_pretrained(tokenizer_path)
+            # Security: Always set trust_remote_code=False to prevent RCE
+            return AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=False)
         except Exception:
             return hf_tokenizer
 
