@@ -259,7 +259,7 @@ class OVCalibrationDatasetBuilder:
         signature = inspect.signature(self.model.forward)
         self._signature_columns = list(signature.parameters.keys())
 
-    def build_from_quantization_config(self, config: OVQuantizationConfigBase) -> OVCalibrationDataset:
+    def build_from_quantization_config(self, config: OVQuantizationConfigBase, trust_remote_code: bool = False) -> OVCalibrationDataset:
         """
         Builds a calibration dataset from a quantization config object. Namely, `quantization_config.dataset` property
         is used to infer dataset name.
@@ -267,6 +267,9 @@ class OVCalibrationDatasetBuilder:
         Args:
             config (`OVQuantizationConfigBase`):
                 The quantization configuration object.
+            trust_remote_code (`bool`, defaults to `False`):
+                Allows to use custom code for tokenizer/processor. This parameter overrides any `trust_remote_code` 
+                value specified in the quantization config.
         Returns:
             A calibration dataset as an instance of `OVCalibrationDataset` containing an `nncf.Dataset` for each model component.
         """
@@ -275,7 +278,7 @@ class OVCalibrationDatasetBuilder:
             raise ValueError("Please provide a dataset for calibration.")
 
         if isinstance(self.model, OVModelForCausalLM):
-            return self._prepare_causal_lm_calibration_data(config)
+            return self._prepare_causal_lm_calibration_data(config, trust_remote_code=trust_remote_code)
         elif isinstance(
             self.model,
             (OVModelForVisualCausalLM, _OVModelForWhisper, OVModelForZeroShotImageClassification, OVSamModel),
@@ -293,6 +296,7 @@ class OVCalibrationDatasetBuilder:
                     dataset_metadata["id"],
                     num_samples=config.num_samples,
                     dataset_split=dataset_metadata["split"],
+                    trust_remote_code=trust_remote_code,
                 )
             elif isinstance(self.model, _OVModelForWhisper):
                 dataset_metadata = PREDEFINED_SPEECH_TO_TEXT_DATASETS[config.dataset]
@@ -304,6 +308,7 @@ class OVCalibrationDatasetBuilder:
                     streaming=dataset_metadata["streaming"],
                     data_dir=dataset_metadata.get("data_dir", None),
                     revision=dataset_metadata.get("revision", None),
+                    trust_remote_code=trust_remote_code,
                 )
             elif isinstance(self.model, OVModelForZeroShotImageClassification):
                 dataset_metadata = PREDEFINED_TEXT_IMAGE_ENCODER_DATASETS[config.dataset]
@@ -313,6 +318,7 @@ class OVCalibrationDatasetBuilder:
                     num_samples=None,
                     dataset_split=dataset_metadata["split"],
                     streaming=dataset_metadata["streaming"],
+                    trust_remote_code=trust_remote_code,
                 )
             elif isinstance(self.model, OVSamModel):
                 dataset_metadata = PREDEFINED_SAM_DATASETS[config.dataset]
@@ -321,6 +327,7 @@ class OVCalibrationDatasetBuilder:
                     dataset_metadata["id"],
                     dataset_split=dataset_metadata["split"],
                     streaming=dataset_metadata["streaming"],
+                    trust_remote_code=trust_remote_code,
                 )
             else:
                 raise Exception
@@ -342,7 +349,7 @@ class OVCalibrationDatasetBuilder:
                     "Please provide dataset as one of the accepted dataset labels or as a list of string prompts."
                 )
 
-            return self.build_from_dataset(config, dataset)
+            return self.build_from_dataset(config, dataset, trust_remote_code=trust_remote_code)
         elif (
             isinstance(self.model, (OVModelForFeatureExtraction, OVModelForMaskedLM, OVModelForSeq2SeqLM))
             or is_sentence_transformers_available()
@@ -371,7 +378,7 @@ class OVCalibrationDatasetBuilder:
                 raise ValueError(
                     "Please provide dataset as one of the accepted dataset labels or as a list of strings."
                 )
-            return self.build_from_dataset(config, dataset)
+            return self.build_from_dataset(config, dataset, trust_remote_code=trust_remote_code)
         else:
             raise RuntimeError("Unsupported model type for calibration dataset collection.")
 
@@ -390,6 +397,7 @@ class OVCalibrationDatasetBuilder:
         batch_size: Optional[int] = 1,
         data_collator: Optional[DataCollator] = None,
         remove_unused_columns: bool = False,
+        trust_remote_code: bool = False,
         **dataset_kwargs,
     ) -> OVCalibrationDataset:
         """
@@ -444,7 +452,7 @@ class OVCalibrationDatasetBuilder:
             **dataset_kwargs,
         )
 
-        return self.build_from_dataset(quantization_config, dataset, batch_size, data_collator, remove_unused_columns)
+        return self.build_from_dataset(quantization_config, dataset, batch_size, data_collator, remove_unused_columns, trust_remote_code)
 
     def build_from_dataset(
         self,
@@ -453,6 +461,7 @@ class OVCalibrationDatasetBuilder:
         batch_size: Optional[int] = 1,
         data_collator: Optional[DataCollator] = None,
         remove_unused_columns: bool = False,
+        trust_remote_code: bool = False,
     ) -> OVCalibrationDataset:
         """
 
@@ -502,23 +511,23 @@ class OVCalibrationDatasetBuilder:
                 )
 
             if isinstance(self.model, OVModelForVisualCausalLM):
-                return self._prepare_visual_causal_lm_calibration_data(quantization_config, dataset)
+                return self._prepare_visual_causal_lm_calibration_data(quantization_config, dataset, trust_remote_code=trust_remote_code)
             elif isinstance(self.model, _OVModelForWhisper):
-                return self._prepare_speech_to_text_calibration_data(quantization_config, dataset)
+                return self._prepare_speech_to_text_calibration_data(quantization_config, dataset, trust_remote_code=trust_remote_code)
             elif isinstance(self.model, OVModelForSeq2SeqLM):
-                return self._prepare_text_to_text_calibration_data(quantization_config, dataset)
+                return self._prepare_text_to_text_calibration_data(quantization_config, dataset, trust_remote_code=trust_remote_code)
             elif is_diffusers_available() and isinstance(self.model, OVDiffusionPipeline):
-                return self._prepare_diffusion_calibration_data(quantization_config, dataset)
+                return self._prepare_diffusion_calibration_data(quantization_config, dataset, trust_remote_code=trust_remote_code)
             elif (
                 isinstance(self.model, (OVModelForFeatureExtraction, OVModelForMaskedLM))
                 or is_sentence_transformers_available()
                 and isinstance(self.model, OVSentenceTransformer)
             ):
-                return self._prepare_text_encoder_model_calibration_data(quantization_config, dataset)
+                return self._prepare_text_encoder_model_calibration_data(quantization_config, dataset, trust_remote_code=trust_remote_code)
             elif isinstance(self.model, OVModelForZeroShotImageClassification):
-                return self._prepare_text_image_encoder_model_calibration_data(quantization_config, dataset)
+                return self._prepare_text_image_encoder_model_calibration_data(quantization_config, dataset, trust_remote_code=trust_remote_code)
             elif isinstance(self.model, OVSamModel):
-                return self._prepare_sam_dataset(quantization_config, dataset)
+                return self._prepare_sam_dataset(quantization_config, dataset, trust_remote_code=trust_remote_code)
             else:
                 raise RuntimeError("Unsupported model type for calibration dataset collection.")
         else:
@@ -654,14 +663,14 @@ class OVCalibrationDatasetBuilder:
         return OVCalibrationDataset(nncf.Dataset(collected_inputs))
 
     def _prepare_causal_lm_calibration_data(
-        self, config: OVQuantizationConfigBase, seqlen: int = 32
+        self, config: OVQuantizationConfigBase, seqlen: int = 32, trust_remote_code: bool = False
     ) -> OVCalibrationDataset:
         """
         Prepares calibration data for causal language models. Relies on `optimum.gptq.data` module.
         """
         from optimum.gptq.data import get_dataset, prepare_dataset
 
-        tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=config.trust_remote_code)
+        tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=trust_remote_code)
         nsamples = config.num_samples if config.num_samples else 128
         if isinstance(config.dataset, str):
             if config.dataset == "auto":
@@ -683,14 +692,15 @@ class OVCalibrationDatasetBuilder:
         config: OVQuantizationConfigBase,
         dataset: "Dataset",
         max_image_size: Optional[int] = 600,
+        trust_remote_code: bool = False,
     ) -> OVCalibrationDataset:
         """
         Prepares calibration data for VLM pipelines.
         Currently, collects data only for a language model component.
         """
-        processor = AutoProcessor.from_pretrained(config.processor, trust_remote_code=config.trust_remote_code)
+        processor = AutoProcessor.from_pretrained(config.processor, trust_remote_code=trust_remote_code)
         try:
-            tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=config.trust_remote_code)
+            tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=trust_remote_code)
             tokenizer_error = None
         except Exception as tokenizer_error:  # noqa: F841
             tokenizer = None
@@ -797,7 +807,7 @@ class OVCalibrationDatasetBuilder:
         return OVCalibrationDataset(collected_inputs)
 
     def _prepare_speech_to_text_calibration_data(
-        self, config: OVQuantizationConfigBase, dataset: "Dataset"
+        self, config: OVQuantizationConfigBase, dataset: "Dataset", trust_remote_code: bool = False
     ) -> OVCalibrationDataset:
         """
         Prepares calibration data for speech-to-text pipelines by inferring it on a dataset and collecting incurred inputs.
@@ -811,7 +821,7 @@ class OVCalibrationDatasetBuilder:
                 component.request, collected_inputs[component_name], apply_caching=True
             )
         try:
-            processor = AutoProcessor.from_pretrained(config.processor, trust_remote_code=config.trust_remote_code)
+            processor = AutoProcessor.from_pretrained(config.processor, trust_remote_code=trust_remote_code)
 
             # Download audio inputs beforehand to avoid possible connection issues
             num_samples = config.num_samples or 32
@@ -836,6 +846,7 @@ class OVCalibrationDatasetBuilder:
         config: OVQuantizationConfigBase,
         dataset: "Dataset",
         seq_len: int = 128,
+        trust_remote_code: bool = False,
     ) -> OVCalibrationDataset:
         """
         Prepares calibration data for text-to-text pipelines by inferring it on a dataset and collecting incurred inputs.
@@ -853,7 +864,7 @@ class OVCalibrationDatasetBuilder:
             def get_tokenizer():
                 if config.tokenizer is None:
                     raise ValueError("Please provide tokenizer for calibration via quantization_config.tokenizer.")
-                return AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=config.trust_remote_code)
+                return AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=trust_remote_code)
 
             num_samples = config.num_samples or 128
             dataset = list(tqdm(dataset.take(num_samples), desc="Downloading dataset", total=num_samples))
@@ -878,7 +889,7 @@ class OVCalibrationDatasetBuilder:
         return OVCalibrationDataset(collected_inputs)
 
     def _prepare_diffusion_calibration_data(
-        self, config: OVQuantizationConfigBase, dataset: Union[List, "Dataset"]
+        self, config: OVQuantizationConfigBase, dataset: Union[List, "Dataset"], trust_remote_code: bool = False
     ) -> OVCalibrationDataset:
         """
         Prepares calibration data for diffusion models by inferring it on a dataset. Currently, collects data only for
@@ -933,6 +944,7 @@ class OVCalibrationDatasetBuilder:
         quantization_config: OVQuantizationConfigBase,
         dataset: "Dataset",
         seq_len: int = 128,
+        trust_remote_code: bool = False,
     ) -> OVCalibrationDataset:
         """
         Prepares calibration data for text-encoder-like models.
@@ -946,7 +958,7 @@ class OVCalibrationDatasetBuilder:
                 if quantization_config.tokenizer is None:
                     raise ValueError("Please provide tokenizer for calibration via quantization_config.tokenizer.")
                 tokenizer = AutoTokenizer.from_pretrained(
-                    quantization_config.tokenizer, trust_remote_code=quantization_config.trust_remote_code
+                    quantization_config.tokenizer, trust_remote_code=trust_remote_code
                 )
             return tokenizer
 
@@ -1017,12 +1029,13 @@ class OVCalibrationDatasetBuilder:
         quantization_config: OVQuantizationConfigBase,
         dataset: "Dataset",
         seq_len: int = 128,
+        trust_remote_code: bool = False,
     ) -> OVCalibrationDataset:
         self.model.compile()
 
         def get_processor():
             processor = AutoProcessor.from_pretrained(
-                quantization_config.processor, trust_remote_code=quantization_config.trust_remote_code
+                quantization_config.processor, trust_remote_code=trust_remote_code
             )
             return processor
 
@@ -1080,7 +1093,7 @@ class OVCalibrationDatasetBuilder:
 
         return OVCalibrationDataset({"model": nncf.Dataset(calibration_data)})
 
-    def _prepare_sam_dataset(self, config: OVQuantizationConfigBase, dataset: "Dataset") -> OVCalibrationDataset:
+    def _prepare_sam_dataset(self, config: OVQuantizationConfigBase, dataset: "Dataset", trust_remote_code: bool = False) -> OVCalibrationDataset:
         collected_inputs: Dict[str, List[Dict[str, Any]]] = {}
         for component_name, component in self.model.components.items():
             collected_inputs[component_name] = []
@@ -1095,7 +1108,7 @@ class OVCalibrationDatasetBuilder:
         )
 
         try:
-            processor = AutoProcessor.from_pretrained(config.processor, trust_remote_code=config.trust_remote_code)
+            processor = AutoProcessor.from_pretrained(config.processor, trust_remote_code=trust_remote_code)
 
             num_samples = config.num_samples or 128
             for item in tqdm(islice(dataset, num_samples), total=num_samples, desc="Collecting calibration data"):
@@ -1168,6 +1181,7 @@ class OVQuantizer(OptimumQuantizer):
         batch_size: int = 1,
         data_collator: Optional[DataCollator] = None,
         remove_unused_columns: bool = False,
+        trust_remote_code: bool = False,
         **kwargs,
     ):
         """
@@ -1190,6 +1204,11 @@ class OVQuantizer(OptimumQuantizer):
                 The function to use to form a batch from a list of elements of the calibration dataset.
             remove_unused_columns (`bool`, defaults to `False`):
                 Whether to remove the columns unused by the model forward method.
+            trust_remote_code (`bool`, defaults to `False`):
+                Allows to use custom code for tokenizer/processor hosted in the model repository. This option should 
+                only be set for repositories you trust and in which you have read the code, as it will execute on 
+                your local machine arbitrary code present in the model repository. This parameter overrides any 
+                `trust_remote_code` value specified in the quantization config.
 
         Examples:
         ```python
@@ -1284,7 +1303,7 @@ class OVQuantizer(OptimumQuantizer):
                 calibration_dataset = None
             else:
                 calibration_dataset = self.dataset_builder.build_from_dataset(
-                    quantization_config, calibration_dataset, batch_size, data_collator, remove_unused_columns
+                    quantization_config, calibration_dataset, batch_size, data_collator, remove_unused_columns, trust_remote_code
                 )
 
         if isinstance(self.model, OVBaseModel):
@@ -1296,6 +1315,7 @@ class OVQuantizer(OptimumQuantizer):
                 ov_config,
                 save_directory,
                 calibration_dataset,
+                trust_remote_code=trust_remote_code,
                 **kwargs,
             )
         elif isinstance(self.model, torch.nn.Module):
@@ -1310,13 +1330,14 @@ class OVQuantizer(OptimumQuantizer):
         ov_config: OVConfig,
         save_directory: Union[str, Path] = None,
         calibration_dataset: Optional[OVCalibrationDataset] = None,
+        trust_remote_code: bool = False,
         **kwargs,
     ):
         quantization_config = ov_config.quantization_config
         dataset_was_built_from_config = False
         if calibration_dataset is None and quantization_config.dataset is not None:
             dataset_was_built_from_config = True
-            calibration_dataset = self.dataset_builder.build_from_quantization_config(quantization_config)
+            calibration_dataset = self.dataset_builder.build_from_quantization_config(quantization_config, trust_remote_code)
 
         quantization_configs = {}
         default_config = None
