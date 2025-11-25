@@ -41,6 +41,7 @@ from .configuration import (
     OVDynamicQuantizationConfig,
     OVQuantizationConfigBase,
     OVWeightQuantizationConfig,
+    _apply_default_ignored_scope_config,
     _quantization_config_from_dict,
     get_default_quantization_config,
 )
@@ -681,14 +682,16 @@ class OVBaseModel(OptimizedModel, OVModelHostMixin):
                 "quantization is not supported with `compile_only` mode, please initialize model without this option"
             )
 
-        # TODO: Expand to pipeline quantization config and apply default ignored scope
         if isinstance(quantization_config, dict):
             quantization_config = _quantization_config_from_dict(quantization_config)
-        quantization_config = self._preprocess_quantization_config(quantization_config, model_name_or_path)
 
         from optimum.intel.openvino.quantization import OVQuantizer
 
         quantizer = OVQuantizer(self, trust_remote_code=trust_remote_code)
+        quantization_config = quantizer._construct_pipeline_quantization_config(quantization_config)
+        quantization_config = _apply_default_ignored_scope_config(model_name_or_path, quantization_config)
+        quantization_config = self._preprocess_quantization_config(quantization_config, model_name_or_path)
+
         quantizer.quantize(ov_config=OVConfig(quantization_config=quantization_config))
 
         if compile_model:
