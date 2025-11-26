@@ -50,6 +50,7 @@ from .utils import (
     OV_XML_FILE_NAME,
     TemporaryDirectory,
     _print_compiled_model_properties,
+    classproperty,
     model_has_dynamic_inputs,
 )
 
@@ -63,6 +64,10 @@ class OVModelHostMixin:
     """
     Mixin class for models that contain OpenVINO models as submodels.
     """
+
+    @classproperty
+    def OV_MODEL_PATHS(cls) -> Dict[str, str]:
+        return {"model": OV_XML_FILE_NAME}
 
     @property
     def ov_models(self) -> Dict[str, Union[openvino.Model, openvino.CompiledModel]]:
@@ -79,6 +84,13 @@ class OVModelHostMixin:
             "`ov_submodels` property is deprecated and will be removed in v1.27. Please use `ov_models` property instead."
         )
         return self.ov_models
+
+    @property
+    def ov_model_paths(self) -> Dict[str, str]:
+        model_paths = {}
+        for ov_model_name in self._ov_model_names:
+            model_paths[ov_model_name] = self.OV_MODEL_PATHS[ov_model_name]
+        return model_paths
 
     @property
     def _ov_model_names(self) -> List[str]:
@@ -131,6 +143,14 @@ class OVModelHostMixin:
         # Clear requests to force recompilation with the new model
         self.clear_requests()
 
+    def unload_ov_model(self, ov_model: openvino.Model):
+        for ov_model_name in self.ov_models:
+            if id(getattr(self, ov_model_name, None)) == id(ov_model):
+                setattr(self, ov_model_name, None)
+        for component in self.components.values():
+            component.unload_ov_model(ov_model)
+        self.clear_requests()
+
     def clear_requests(self):
         """
         Clear model inference requests.
@@ -155,7 +175,6 @@ class OVBaseModel(OptimizedModel, OVModelHostMixin):
     _supports_cache_class = False  # No loger defined/used in transformers
     _is_stateful = False  # for Transformers it's False, but True for SSMs
     _library_name = "transformers"
-    _xml_model_name = OV_XML_FILE_NAME
     _search_pattern = r"(.*)?openvino(.*)?\_(.*)?.xml$"
 
     def __init__(
@@ -400,7 +419,7 @@ class OVBaseModel(OptimizedModel, OVModelHostMixin):
             raise ValueError(
                 "`save_pretrained()` is not supported with `compile_only=True` mode, to save your model please initialize your model with compile_only=False"
             )
-        dst_path = os.path.join(save_directory, self._xml_model_name)
+        dst_path = os.path.join(save_directory, self.ov_model_paths["model"])
         openvino.save_model(self.model, dst_path, compress_to_fp16=False)
         generation_config = getattr(self, "generation_config", None)
         if generation_config is not None:
@@ -469,7 +488,7 @@ class OVBaseModel(OptimizedModel, OVModelHostMixin):
                 Whether to trust remote code when loading model tokenizer/processor during quantization.
         """
         model_path = Path(model_id)
-        default_file_name = ONNX_WEIGHTS_NAME if from_onnx else OV_XML_FILE_NAME
+        default_file_name = ONNX_WEIGHTS_NAME if from_onnx else cls.OV_MODEL_PATHS["model"]
         file_name = file_name or default_file_name
 
         model_cache_path = cls._cached_file(
@@ -658,6 +677,8 @@ class OVBaseModel(OptimizedModel, OVModelHostMixin):
         compile_model: bool,
         model_name_or_path: str,
         trust_remote_code: Optional[bool] = False,
+        save_directory: Optional[Union[str, Path]] = None,
+        save_ov_model_files_only: Optional[bool] = False,
     ):
         """
         Apply quantization to the model.
@@ -689,7 +710,11 @@ class OVBaseModel(OptimizedModel, OVModelHostMixin):
         from optimum.intel.openvino.quantization import OVQuantizer
 
         quantizer = OVQuantizer(self, trust_remote_code=trust_remote_code)
-        quantizer.quantize(ov_config=OVConfig(quantization_config=quantization_config))
+        quantizer.quantize(
+            ov_config=OVConfig(quantization_config=quantization_config),
+            save_directory=save_directory,
+            save_ov_model_files_only=save_ov_model_files_only,
+        )
 
         if compile_model:
             self.compile()
@@ -854,7 +879,7 @@ class OVBaseModel(OptimizedModel, OVModelHostMixin):
             model=model,
             config=onnx_config,
             opset=onnx_config.DEFAULT_ONNX_OPSET,
-            output=save_dir_path / OV_XML_FILE_NAME,
+            output=save_dir_path / cls.OV_MODEL_PATHS["model"],
             stateful=stateful,
         )
 

@@ -615,7 +615,7 @@ def _apply_generic_quantization(
     """
     Apply quantization with a general quantization config to the exported model and save it to disk.
     """
-    from ...intel.openvino.utils import _HEAD_TO_AUTOMODELS, TemporaryDirectory
+    from ...intel.openvino.utils import _HEAD_TO_AUTOMODELS
     from ...intel.utils.import_utils import DIFFUSERS_IMPORT_ERROR, is_diffusers_available
 
     # Step 1. Obtain the correct OpenVINO model class
@@ -652,25 +652,15 @@ def _apply_generic_quantization(
     )
 
     # Step 3. Apply quantization
-    with TemporaryDirectory() as tmpdir:
-        # Save quantize model to a temporary directory to avoid conflicts when reading and writing from the same directory
-        model._apply_quantization(
-            quantization_config,
-            compile_only=False,
-            compile_model=False,
-            model_name_or_path=model_name_or_path,
-            trust_remote_code=trust_remote_code,
-        )
-        model.save_pretrained(tmpdir)
-
-        del model
-        gc.collect()
-
-        # Move quantized model to the output directory
-        output.mkdir(parents=True, exist_ok=True)
-        for item in Path(tmpdir).iterdir():
-            dest = output / item.name
-            _merge_move(item, dest)
+    model._apply_quantization(
+        quantization_config,
+        compile_only=False,
+        compile_model=False,
+        model_name_or_path=model_name_or_path,
+        trust_remote_code=trust_remote_code,
+        save_directory=output,
+        save_ov_model_files_only=True,
+    )
 
 
 def _apply_model_size_based_quantization(submodel_paths: List[str], ov_config: "OVConfig", output: Union[str, Path]):
