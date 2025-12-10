@@ -791,13 +791,11 @@ class OVBaseModel(OptimizedModel, OVModelHostMixin):
             )
             compile_only = False
 
-        # If load_in_8bit and quantization_config not specified then ov_config is set to None and will be set by default in convert depending on the model size
-        if load_in_8bit is None and not quantization_config:
-            ov_config = None
-        else:
-            ov_config = OVConfig(dtype="fp32")
+        ov_config = cls._prepare_ov_config_for_export(kwargs.pop("ov_config", None), quantization_config, load_in_8bit)
+        quantization_config = quantization_config or (ov_config.quantization_config if ov_config else None)
 
         variant = kwargs.pop("variant", None)
+        pad_token_id = kwargs.pop("pad_token_id", None)
 
         main_export(
             model_name_or_path=model_id,
@@ -813,6 +811,7 @@ class OVBaseModel(OptimizedModel, OVModelHostMixin):
             ov_config=ov_config,
             library_name=cls._library_name,
             variant=variant,
+            pad_token_id=pad_token_id,
         )
 
         return cls._from_pretrained(
@@ -969,6 +968,28 @@ class OVBaseModel(OptimizedModel, OVModelHostMixin):
                 return f"Got unexpected inputs: `{input_name}` set to {type(inputs[input_name])} while expected to be {dtype}."
 
         return None
+
+    @staticmethod
+    def _prepare_ov_config_for_export(
+        ov_config: Optional[OVConfig] = None,
+        quantization_config: Union[OVWeightQuantizationConfig, Dict] = None,
+        load_in_8bit: Optional[bool] = None,
+    ) -> OVConfig:
+        if ov_config is not None:
+            if quantization_config is not None:
+                if ov_config.quantization_config is not None:
+                    logger.warning(
+                        "Both `ov_config.quantization_config` and `quantization_config` are provided, "
+                        "`quantization_config` will be used for export."
+                    )
+                ov_config.quantization_config = quantization_config
+        else:
+            ov_config = OVConfig(dtype="auto", quantization_config=quantization_config)
+        if load_in_8bit is None and quantization_config is None and ov_config.quantization_config is None:
+            # If load_in_8bit and quantization_config are not specified then ov_config is set to None, and
+            # models larger than 1B parameters will be quantized to int8
+            ov_config = None
+        return ov_config
 
 
 class OVModelPart(OVModelHostMixin):

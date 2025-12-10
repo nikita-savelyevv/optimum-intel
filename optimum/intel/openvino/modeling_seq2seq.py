@@ -593,13 +593,11 @@ class OVModelForSeq2SeqLM(OVBaseModel, GenerationMixin):
                 "Please provide openvino model obtained using optimum-cli or saved on disk using `save_pretrained`"
             )
             compile_only = False
-        # If load_in_8bit and quantization_config not specified then ov_config is set to None and will be set by default in convert depending on the model size
-        if load_in_8bit is None and not quantization_config:
-            ov_config = None
-        else:
-            ov_config = OVConfig(dtype="fp32")
+        ov_config = cls._prepare_ov_config_for_export(kwargs.pop("ov_config", None), quantization_config, load_in_8bit)
+        quantization_config = quantization_config or (ov_config.quantization_config if ov_config else None)
         stateful = kwargs.get("stateful", True)
         variant = kwargs.pop("variant", None)
+        pad_token_id = kwargs.pop("pad_token_id", None)
 
         # now we use model_kwargs only for text-to-speech models to specify vocoder
         model_kwargs = kwargs if cls.export_feature == "text-to-audio" else None
@@ -618,6 +616,7 @@ class OVModelForSeq2SeqLM(OVBaseModel, GenerationMixin):
             ov_config=ov_config,
             stateful=stateful,
             variant=variant,
+            pad_token_id=pad_token_id,
             model_kwargs=model_kwargs,
         )
 

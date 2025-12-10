@@ -45,6 +45,7 @@ from .utils import (
     clear_class_registry,
     deduce_diffusers_dtype,
     load_preprocessors,
+    save_preprocessors,
 )
 
 
@@ -75,7 +76,9 @@ def infer_task(
     cache_dir: str = HUGGINGFACE_HUB_CACHE,
     token: Optional[Union[bool, str]] = None,
     library_name: Optional[str] = None,
+    trust_remote_code: bool = False,
 ):
+    original_task = task
     task = TasksManager.map_from_synonym(task)
     if task == "auto":
         if library_name == "open_clip":
@@ -104,7 +107,57 @@ def infer_task(
                 raise RequestsConnectionError(
                     f"The task could not be automatically inferred as this is available only for models hosted on the Hugging Face Hub. Please provide the argument --task with the relevant task from {', '.join(TasksManager.get_all_tasks())}. Detailed error: {e}"
                 )
+
+    if library_name == "transformers":
+        config = AutoConfig.from_pretrained(
+            model_name_or_path,
+            subfolder=subfolder,
+            revision=revision,
+            cache_dir=cache_dir,
+            token=token,
+            trust_remote_code=trust_remote_code,
+        )
+        if hasattr(config, "export_model_type"):
+            model_type = config.export_model_type
+        else:
+            model_type = config.model_type
+        custom_architecture = model_type not in TasksManager._SUPPORTED_MODEL_TYPE
+        if not custom_architecture and task + "-with-past" in TasksManager.get_supported_tasks_for_model_type(
+            model_type, exporter="openvino", library_name=library_name
+        ):
+            # Make -with-past the default if --task was not explicitly specified
+            if original_task == "auto":
+                task = task + "-with-past"
+            else:
+                logger.info(
+                    f"The task `{task}` was manually specified, and past key values will not be reused in the decoding."
+                    f" if needed, please pass `--task {task}-with-past` to export using the past key values."
+                )
+
     return task
+
+
+def infer_library_name(
+    model_name_or_path: str,
+    subfolder: str = "",
+    revision: Optional[str] = None,
+    cache_dir: str = HUGGINGFACE_HUB_CACHE,
+    token: Optional[Union[bool, str]] = None,
+) -> str:
+    library_name = _infer_library_from_model_name_or_path(
+        model_name_or_path=model_name_or_path,
+        subfolder=subfolder,
+        revision=revision,
+        cache_dir=cache_dir,
+        token=token,
+    )
+    if library_name == "sentence_transformers":
+        logger.warning(
+            "Library name is not specified. There are multiple possible variants: `sentence_tenasformers`, `transformers`."
+            "`transformers` will be selected. If you want to load your model with the `sentence-transformers` library instead, please set --library sentence_transformers"
+        )
+        library_name = "transformers"
+    return library_name
 
 
 def main_export(
@@ -216,19 +269,13 @@ def main_export(
         )
 
     if library_name is None:
-        library_name = _infer_library_from_model_name_or_path(
-            model_name_or_path=model_name_or_path,
+        library_name = infer_library_name(
+            model_name_or_path,
             subfolder=subfolder,
             revision=revision,
             cache_dir=cache_dir,
             token=token,
         )
-        if library_name == "sentence_transformers":
-            logger.warning(
-                "Library name is not specified. There are multiple possible variants: `sentence_tenasformers`, `transformers`."
-                "`transformers` will be selected. If you want to load your model with the `sentence-transformers` library instead, please set --library sentence_transformers"
-            )
-            library_name = "transformers"
 
     original_task = task
     task = infer_task(
@@ -239,11 +286,11 @@ def main_export(
         cache_dir=cache_dir,
         token=token,
         library_name=library_name,
+        trust_remote_code=trust_remote_code,
     )
 
     do_gptq_patching = False
     do_quant_patching = False
-    custom_architecture = False
     patch_16bit = False
     loading_kwargs = model_loading_kwargs or {}
     if variant is not None:
@@ -278,10 +325,14 @@ def main_export(
 
         model_type = config.model_type
         if model_type not in TasksManager._SUPPORTED_MODEL_TYPE:
-            custom_architecture = True
             if custom_export_configs is None:
                 raise ValueError(
-                    f"Trying to export a {model_type} model, that is a custom or unsupported architecture, but no custom export configuration was passed as `custom_export_configs`. Please refer to https://huggingface.co/docs/optimum/main/en/exporters/onnx/usage_guides/export_a_model#custom-export-of-transformers-models for an example on how to export custom models. Please open an issue at https://github.com/huggingface/optimum-intel/issues if you would like the model type {model_type} to be supported natively in the OpenVINO export."
+                    f"Trying to export a {model_type} model, that is a custom or unsupported architecture, but no "
+                    "custom export configuration was passed as `custom_export_configs`. Please refer to "
+                    "https://huggingface.co/docs/optimum/main/en/exporters/onnx/usage_guides/export_a_model#custom-export-of-transformers-models "
+                    "for an example on how to export custom models. Please open an issue at "
+                    "https://github.com/huggingface/optimum-intel/issues if you would like the model type "
+                    f"{model_type} to be supported natively in the OpenVINO export."
                 )
         elif task not in TasksManager.get_supported_tasks_for_model_type(
             model_type, exporter="openvino", library_name=library_name
@@ -453,23 +504,6 @@ def main_export(
         else:
             model_type = model.config.model_type
 
-        if (
-            not custom_architecture
-            and library_name != "diffusers"
-            and task + "-with-past"
-            in TasksManager.get_supported_tasks_for_model_type(
-                model_type, exporter="openvino", library_name=library_name
-            )
-        ):
-            # Make -with-past the default if --task was not explicitely specified
-            if original_task == "auto":
-                task = task + "-with-past"
-            else:
-                logger.info(
-                    f"The task `{task}` was manually specified, and past key values will not be reused in the decoding."
-                    f" if needed, please pass `--task {task}-with-past` to export using the past key values."
-                )
-
         if original_task == "auto":
             synonyms_for_task = sorted(TasksManager.synonyms_for_task(task))
             if synonyms_for_task:
@@ -519,52 +553,50 @@ def main_export(
             if do_bitnet_patching:
                 AutoBitLinear.load_hook = orig_load_hook
 
-    return library_name, task
 
-
-def main_quantize(
+def main_export_and_quantize(
     model_name_or_path: str,
-    original_task: str,
-    task: str,
-    library_name: str,
-    quantization_config: Union[Dict, "OVQuantizationConfigBase"],  # noqa: F821
-    output: Path,
-    cache_dir: str,
+    output: Union[str, Path],
+    task: str = "auto",
+    framework: str = "pt",
+    cache_dir: str = HUGGINGFACE_HUB_CACHE,
     trust_remote_code: bool = False,
+    pad_token_id: Optional[int] = None,
+    subfolder: str = "",
+    revision: str = "main",
+    token: Optional[Union[bool, str]] = None,
     model_kwargs: Optional[Dict[str, Any]] = None,
+    ov_config: "OVConfig" = None,
+    stateful: bool = True,
+    convert_tokenizer: bool = False,
+    library_name: Optional[str] = None,
+    variant: Optional[str] = None,
 ):
-    """
-    Apply quantization to the OpenVINO model exported to `output` directory.
-
-    Args:
-        model_name_or_path (`str`):
-            Model ID on huggingface.co or path on disk to the model repository.
-        original_task (`str`):
-            The original task to export the model for.
-        task (`str`):
-            The inferred task to export the model for.
-        library_name (`str`):
-            The library name.
-        quantization_config (`Union[Dict, OVQuantizationConfigBase]`):
-            The quantization configuration to use.
-        output (`Path`):
-            Path indicating the directory where the exported OpenVINO model is stored and where to save the
-            quantized model.
-        cache_dir (`Optional[str]`, defaults to `None`):
-            Path indicating where to store cache. The default Hugging Face cache path will be used by default.
-        trust_remote_code (`bool`, defaults to `False`):
-            Allows to use custom code for the modeling hosted in the model repository. This option should only be set for repositories
-            you trust and in which you have read the code, as it will execute on your local machine arbitrary code present in the
-            model repository.
-        model_kwargs (`Optional[Dict[str, Any]]`, defaults to `None`):
-            Experimental usage: keyword arguments to pass to the model during
-            the export. This argument should be used along the `custom_export_configs` argument
-            in case, for example, the model inputs/outputs are changed (for example, if
-            `model_kwargs={"output_attentions": True}` is passed).
-
-    """
-    from ...intel.openvino.utils import _HEAD_TO_AUTOMODELS, TemporaryDirectory
+    from ...intel.openvino.utils import _HEAD_TO_AUTOMODELS
     from ...intel.utils.import_utils import DIFFUSERS_IMPORT_ERROR, is_diffusers_available
+
+    if framework is not None and framework != "pt":
+        raise ValueError("Only PyTorch models are supported for OpenVINO export with quantization.")
+
+    if library_name is None:
+        library_name = infer_library_name(
+            model_name_or_path,
+            subfolder=subfolder,
+            revision=revision,
+            cache_dir=cache_dir,
+            token=token,
+        )
+    original_task = task
+    task = infer_task(
+        original_task,
+        model_name_or_path,
+        subfolder=subfolder,
+        revision=revision,
+        cache_dir=cache_dir,
+        token=token,
+        library_name=library_name,
+        trust_remote_code=trust_remote_code,
+    )
 
     # Step 1. Obtain the correct OpenVINO model class
     if library_name == "diffusers":
@@ -589,40 +621,42 @@ def main_quantize(
         except (AttributeError, ImportError, KeyError) as e:
             raise RuntimeError(f"Wasn't able to locate OpenVINO class for task {original_task} ({task}).") from e
 
-    # Step 2. Load the exported model
+    # Step 2. Load the exported model and quantize it
     additional_model_kwargs = (
         {"use_cache": task.endswith("with-past")}
         if "generation" in task or task.startswith("automatic-speech-recognition")
         else {}
     )
     model = model_cls.from_pretrained(
-        output,
+        model_name_or_path,
+        export=True,
         compile=False,
+        ov_config=ov_config,
         trust_remote_code=trust_remote_code,
+        subfolder=subfolder,
         cache_dir=cache_dir,
+        revision=revision,
+        token=token,
+        stateful=stateful,
+        pad_token_id=pad_token_id,
+        variant=variant,
         **((model_kwargs or {}) | additional_model_kwargs),
     )
 
-    # Step 3. Apply quantization
-    with TemporaryDirectory() as tmpdir:
-        # Save quantized model to a temporary directory to avoid conflicts when reading and writing from the same directory
-        model._apply_quantization(
-            quantization_config,
-            compile_only=False,
-            compile_model=False,
-            model_name_or_path=model_name_or_path,
-            trust_remote_code=trust_remote_code,
+    # Step 3. Save the quantized model
+    model.save_pretrained(output)
+    preprocessors = None
+    if library_name != "diffusers":
+        if hasattr(model.config, "export_model_type"):
+            model_type = model.config.export_model_type
+        else:
+            model_type = model.config.model_type
+        preprocessors = load_preprocessors(
+            model_name_or_path, subfolder=subfolder, trust_remote_code=trust_remote_code, model_type=model_type
         )
-        model.save_pretrained(tmpdir)
-
-        del model
-        gc.collect()
-
-        # Move quantized model to the output directory
-        output.mkdir(parents=True, exist_ok=True)
-        for item in Path(tmpdir).iterdir():
-            dest = output / item.name
-            _merge_move(item, dest)
+        save_preprocessors(preprocessors, model.config, output, trust_remote_code)
+    if convert_tokenizer:
+        maybe_convert_tokenizers(library_name, output, preprocessors=preprocessors, task=task)
 
 
 def maybe_convert_tokenizers(library_name: str, output: Path, model=None, preprocessors=None, task=None):
@@ -733,47 +767,3 @@ def _apply_model_size_based_quantization(submodel_paths: List[str], ov_config: "
         submodel_path.with_suffix(".bin").unlink()
         compressed_submodel_path.rename(submodel_path)
         compressed_submodel_path.with_suffix(".bin").rename(submodel_path.with_suffix(".bin"))
-
-
-def _merge_move(src: Path, dest: Path):
-    """
-    Move src to dest.
-
-    - If src is a directory:
-        - If dest does not exist: rename src -> dest.
-        - If dest is a directory: merge src into dest recursively.
-        - If dest is a file: replace file with src directory (delete file, then rename).
-
-    - If src is a file:
-        - If dest does not exist: rename src -> dest.
-        - If dest is a file: overwrite file (delete dest, then rename).
-        - If dest is a directory: replace directory with src file (delete directory recursively, then rename).
-    """
-    dest_exists = dest.exists()
-    dest_is_dir = dest_exists and dest.is_dir()
-    if src.is_dir():
-        if not dest_exists:
-            # No conflict: just rename
-            src.rename(dest)
-        elif dest_is_dir:
-            # Merge src into dest recursively
-            for child in src.iterdir():
-                _merge_move(child, dest / child.name)
-            # Remove src once empty
-            src.rmdir()
-        else:
-            # dest exists and is a file: replace file with directory
-            dest.unlink()
-            src.rename(dest)
-    else:
-        if not dest_exists:
-            # No conflict: just rename
-            src.rename(dest)
-        elif dest_is_dir:
-            # Replace directory (recursively) with file
-            shutil.rmtree(dest)
-            src.rename(dest)
-        else:
-            # dest is a file: overwrite
-            dest.unlink()
-            src.rename(dest)

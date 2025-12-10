@@ -598,12 +598,8 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             )
             compile_only = False
 
-        # If load_in_8bit and quantization_config not specified then ov_config is set
-        # to None and will be set by default in convert depending on the model size
-        if load_in_8bit is None and not quantization_config:
-            ov_config = None
-        else:
-            ov_config = OVConfig(dtype="auto")
+        ov_config = cls._prepare_ov_config_for_export(kwargs.pop("ov_config", None), quantization_config, load_in_8bit)
+        quantization_config = quantization_config or (ov_config.quantization_config if ov_config else None)
 
         torch_dtype = kwargs.pop("torch_dtype", None)
 
@@ -615,6 +611,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
         model_save_dir = TemporaryDirectory()
         model_save_path = Path(model_save_dir.name)
         variant = kwargs.pop("variant", None)
+        pad_token_id = kwargs.pop("pad_token_id", None)
 
         main_export(
             model_name_or_path=model_id,
@@ -630,6 +627,7 @@ class OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):
             ov_config=ov_config,
             library_name=cls._library_name,
             variant=variant,
+            pad_token_id=pad_token_id,
             model_loading_kwargs=model_loading_kwargs,
         )
 

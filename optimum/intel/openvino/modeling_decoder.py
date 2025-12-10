@@ -42,7 +42,6 @@ from ...exporters.openvino.utils import SSM_MODELS
 from ..utils.import_utils import compare_versions
 from ..utils.modeling_utils import MULTI_QUERY_ATTN_MODELS
 from .configuration import (
-    OVConfig,
     OVQuantizationConfigBase,
     OVWeightQuantizationConfig,
 )
@@ -321,11 +320,8 @@ class OVBaseDecoderModel(OVModel, PushToHubMixin):
             if use_cache:
                 task = task + "-with-past"
 
-        # If load_in_8bit and quantization_config not specified then ov_config is set to None and will be set by default in convert depending on the model size
-        if load_in_8bit is None and not quantization_config:
-            ov_export_config = None
-        else:
-            ov_export_config = OVConfig(dtype="auto")
+        ov_config = cls._prepare_ov_config_for_export(kwargs.pop("ov_config", None), quantization_config, load_in_8bit)
+        quantization_config = quantization_config or (ov_config.quantization_config if ov_config else None)
 
         stateful = kwargs.pop("stateful", ensure_stateful_is_available(warn=False) and use_cache)
 
@@ -337,6 +333,7 @@ class OVBaseDecoderModel(OVModel, PushToHubMixin):
             model_loading_kwargs["torch_dtype"] = torch_dtype
 
         variant = kwargs.pop("variant", None)
+        pad_token_id = kwargs.pop("pad_token_id", None)
 
         main_export(
             model_name_or_path=model_id,
@@ -349,11 +346,12 @@ class OVBaseDecoderModel(OVModel, PushToHubMixin):
             local_files_only=local_files_only,
             force_download=force_download,
             trust_remote_code=trust_remote_code,
-            ov_config=ov_export_config,
+            ov_config=ov_config,
             stateful=stateful,
             model_loading_kwargs=model_loading_kwargs,
             library_name=cls._library_name,
             variant=variant,
+            pad_token_id=pad_token_id,
         )
 
         if config.model_type == "phi3" and config.max_position_embeddings != getattr(

@@ -37,7 +37,7 @@ from optimum.exporters.tasks import TasksManager
 
 from ...exporters.openvino import main_export
 from ..utils.modeling_utils import _find_files_matching_pattern, _OpenClipForZeroShotImageClassification
-from .configuration import OVConfig, OVWeightQuantizationConfig
+from .configuration import OVWeightQuantizationConfig
 from .modeling import MODEL_START_DOCSTRING, OVModel
 from .modeling_base import OVModelHostMixin
 from .utils import TemporaryDirectory
@@ -245,11 +245,8 @@ class OVModelOpenCLIPText(OVModelOpenCLIPBase):
         # would end-up removing the directory containing the underlying OpenVINO model
         cls._model_save_dir_tempdirectory_instance = save_dir
 
-        # If load_in_8bit and quantization_config not specified then ov_config is set to None and will be set by default in convert depending on the model size
-        if load_in_8bit is None and not quantization_config:
-            ov_config = None
-        else:
-            ov_config = OVConfig(dtype="fp32")
+        ov_config = cls._prepare_ov_config_for_export(kwargs.pop("ov_config", None), quantization_config, load_in_8bit)
+        quantization_config = quantization_config or (ov_config.quantization_config if ov_config else None)
 
         def fn_get_submodels(model):
             return {"model_text": model.text}
@@ -370,11 +367,8 @@ class OVModelOpenCLIPVisual(OVModelOpenCLIPBase):
         # would end-up removing the directory containing the underlying OpenVINO model
         cls._model_save_dir_tempdirectory_instance = save_dir
 
-        # If load_in_8bit and quantization_config not specified then ov_config is set to None and will be set by default in convert depending on the model size
-        if load_in_8bit is None and not quantization_config:
-            ov_config = None
-        else:
-            ov_config = OVConfig(dtype="fp32")
+        ov_config = cls._prepare_ov_config_for_export(kwargs.pop("ov_config", None), quantization_config, load_in_8bit)
+        quantization_config = quantization_config or (ov_config.quantization_config if ov_config else None)
 
         def fn_get_submodels(model):
             return {"model_vision": model.visual}
