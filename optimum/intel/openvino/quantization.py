@@ -509,7 +509,7 @@ class OVCalibrationDatasetBuilder:
                 return self._prepare_speech_to_text_calibration_data(quantization_config, dataset)
             elif isinstance(self.model, OVModelForSeq2SeqLM):
                 return self._prepare_text_to_text_calibration_data(
-                    quantization_config, dataset, **quantization_config.dataset_kwargs
+                    quantization_config, dataset, seq_len=quantization_config.dataset_kwargs.get("seq_len")
                 )
             elif is_diffusers_available() and isinstance(self.model, OVDiffusionPipeline):
                 return self._prepare_diffusion_calibration_data(quantization_config, dataset)
@@ -519,11 +519,11 @@ class OVCalibrationDatasetBuilder:
                 and isinstance(self.model, OVSentenceTransformer)
             ):
                 return self._prepare_text_encoder_model_calibration_data(
-                    quantization_config, dataset, **quantization_config.dataset_kwargs
+                    quantization_config, dataset, seq_len=quantization_config.dataset_kwargs.get("seq_len")
                 )
             elif isinstance(self.model, OVModelForZeroShotImageClassification):
                 return self._prepare_text_image_encoder_model_calibration_data(
-                    quantization_config, dataset, **quantization_config.dataset_kwargs
+                    quantization_config, dataset, seq_len=quantization_config.dataset_kwargs.get("seq_len")
                 )
             elif isinstance(self.model, OVSamModel):
                 return self._prepare_sam_dataset(quantization_config, dataset)
@@ -669,7 +669,6 @@ class OVCalibrationDatasetBuilder:
         """
         from optimum.gptq.data import get_dataset, prepare_dataset
 
-        # Integrate seq_len from dataset_kwargs
         seq_len = seq_len or config.dataset_kwargs.get("seq_len")
 
         tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=self.trust_remote_code)

@@ -2317,3 +2317,118 @@ def check_model_inference(ov_model, model_id, trust_remote_code):
         ov_model(**inputs)
     else:
         raise Exception("Unexpected model class.")
+
+
+class TestDatasetParsing(unittest.TestCase):
+    """Test suite for dataset option parsing in OVQuantizationConfigBase."""
+
+    def test_dataset_no_options(self):
+        """Test that a simple dataset name without options is preserved."""
+        config = OVQuantizationConfigBase(dataset="wikitext")
+        self.assertEqual(config.dataset, "wikitext")
+        self.assertEqual(config.dataset_kwargs, {})
+
+    def test_dataset_with_seq_len_option(self):
+        """Test parsing of seq_len option from dataset string."""
+        config = OVQuantizationConfigBase(dataset="wikitext:seq_len=128")
+        self.assertEqual(config.dataset, "wikitext")
+        self.assertEqual(config.dataset_kwargs, {"seq_len": 128})
+
+    def test_dataset_gsm8k_with_seq_len(self):
+        """Test parsing of seq_len option for gsm8k dataset."""
+        config = OVQuantizationConfigBase(dataset="gsm8k:seq_len=512")
+        self.assertEqual(config.dataset, "gsm8k")
+        self.assertEqual(config.dataset_kwargs, {"seq_len": 512})
+
+    def test_dataset_with_multiple_spaces(self):
+        """Test parsing with spaces around the option."""
+        config = OVQuantizationConfigBase(dataset="wikitext:seq_len = 64")
+        self.assertEqual(config.dataset, "wikitext")
+        self.assertEqual(config.dataset_kwargs, {"seq_len": 64})
+
+    def test_dataset_list_no_parsing(self):
+        """Test that list datasets skip parsing and remain unchanged."""
+        dataset_list = ["sample text 1", "sample text 2", "sample text 3"]
+        config = OVQuantizationConfigBase(dataset=dataset_list)
+        self.assertEqual(config.dataset, dataset_list)
+        self.assertEqual(config.dataset_kwargs, {})
+
+    def test_dataset_unsupported_option(self):
+        """Test that unsupported options raise ValueError."""
+        with pytest.raises(ValueError) as exc_info:
+            OVQuantizationConfigBase(dataset="wikitext:foo=bar")
+        assert "Unsupported dataset option 'foo'" in str(exc_info.value)
+        assert "Only 'seq_len' is supported" in str(exc_info.value)
+
+    def test_dataset_malformed_option_no_equals(self):
+        """Test that options without '=' raise ValueError."""
+        with pytest.raises(ValueError) as exc_info:
+            OVQuantizationConfigBase(dataset="wikitext:seq_len")
+        assert "Malformed dataset option" in str(exc_info.value)
+        assert "Expected format: 'key=value'" in str(exc_info.value)
+
+    def test_dataset_invalid_seq_len_value(self):
+        """Test that non-integer seq_len values raise ValueError."""
+        with pytest.raises(ValueError) as exc_info:
+            OVQuantizationConfigBase(dataset="wikitext:seq_len=abc")
+        assert "Invalid value 'abc' for seq_len" in str(exc_info.value)
+        assert "Expected an integer" in str(exc_info.value)
+
+    def test_dataset_empty_string_option(self):
+        """Test that empty seq_len value raises ValueError."""
+        with pytest.raises(ValueError) as exc_info:
+            OVQuantizationConfigBase(dataset="wikitext:seq_len=")
+        assert "Invalid value '' for seq_len" in str(exc_info.value)
+
+    def test_dataset_none(self):
+        """Test that None dataset is handled correctly."""
+        config = OVQuantizationConfigBase(dataset=None)
+        self.assertIsNone(config.dataset)
+        self.assertEqual(config.dataset_kwargs, {})
+
+    def test_dataset_with_colon_in_name_only(self):
+        """Test handling of dataset string with trailing colon but no options."""
+        config = OVQuantizationConfigBase(dataset="wikitext:")
+        self.assertEqual(config.dataset, "wikitext")
+        self.assertEqual(config.dataset_kwargs, {})
+
+    def test_causal_lm_seq_len_from_dataset_kwargs(self):
+        """Test that seq_len from dataset_kwargs is used in causal LM calibration."""
+        config = OVQuantizationConfigBase(dataset="wikitext2:seq_len=256", tokenizer="gpt2", num_samples=2)
+        self.assertEqual(config.dataset, "wikitext2")
+        self.assertEqual(config.dataset_kwargs, {"seq_len": 256})
+
+    def test_gsm8k_custom_seq_len_overrides_default(self):
+        """Test that custom seq_len for gsm8k overrides the default 256."""
+        config = OVQuantizationConfigBase(dataset="gsm8k:seq_len=512", tokenizer="gpt2", num_samples=2)
+        self.assertEqual(config.dataset, "gsm8k")
+        self.assertEqual(config.dataset_kwargs, {"seq_len": 512})
+
+    def test_text_to_text_seq_len_from_kwargs(self):
+        """Test that seq_len can be passed via dataset_kwargs to text-to-text helper."""
+        config = OVQuantizationConfigBase(dataset="c4:seq_len=256", tokenizer="t5-small", num_samples=2)
+        self.assertEqual(config.dataset, "c4")
+        self.assertEqual(config.dataset_kwargs, {"seq_len": 256})
+
+    def test_text_encoder_seq_len_from_kwargs(self):
+        """Test that seq_len can be passed via dataset_kwargs to text encoder helper."""
+        config = OVQuantizationConfigBase(dataset="wikitext:seq_len=64", tokenizer="bert-base-uncased", num_samples=2)
+        self.assertEqual(config.dataset, "wikitext")
+        self.assertEqual(config.dataset_kwargs, {"seq_len": 64})
+
+    def test_backward_compatibility_no_options(self):
+        """Test that datasets without options work as before."""
+        configs = [
+            OVQuantizationConfigBase(dataset="wikitext2", tokenizer="gpt2"),
+            OVQuantizationConfigBase(dataset="gsm8k", tokenizer="gpt2"),
+            OVQuantizationConfigBase(dataset="c4", tokenizer="t5-small"),
+        ]
+        for config in configs:
+            self.assertEqual(config.dataset_kwargs, {})
+
+    def test_list_dataset_backward_compatibility(self):
+        """Test that list datasets work unchanged."""
+        dataset_list = ["This is text 1", "This is text 2"]
+        config = OVQuantizationConfigBase(dataset=dataset_list, tokenizer="gpt2")
+        self.assertEqual(config.dataset, dataset_list)
+        self.assertEqual(config.dataset_kwargs, {})
