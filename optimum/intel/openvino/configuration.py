@@ -562,14 +562,55 @@ class OVQuantizationConfigBase(QuantizationConfigMixin):
             num_samples (`int`, *optional*):
                 The maximum number of samples composing the calibration dataset.
             dataset (`str or List[str]`, *optional*):
-                The dataset used for data-aware optimization with NNCF.
+                The dataset used for data-aware optimization with NNCF. Can be a dataset name (e.g., 'wikitext')
+                or a string with options (e.g., 'wikitext:seq_len=128'). Currently supported option: seq_len.
             tokenizer (`str`, *optional*):
                 The tokenizer used to process the dataset.
             processor (`str`, *optional*):
                 A transformers processor used to process the dataset inputs.
         """
         self.num_samples = num_samples
-        self.dataset = dataset
+        
+        # Parse dataset string for options
+        self.dataset_kwargs = {}
+        if isinstance(dataset, str) and ":" in dataset:
+            # Parse dataset with options: "dataset_name:key1=value1,key2=value2"
+            parts = dataset.split(":", 1)
+            self.dataset = parts[0]
+            options_str = parts[1]
+            
+            # Parse options
+            for option in options_str.split(","):
+                option = option.strip()
+                if not option:
+                    continue
+                if "=" not in option:
+                    raise ValueError(
+                        f"Malformed dataset option '{option}' in dataset spec '{dataset}'. "
+                        f"Expected format: 'key=value'."
+                    )
+                key, value = option.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                
+                # Validate and parse known options
+                if key == "seq_len":
+                    try:
+                        self.dataset_kwargs[key] = int(value)
+                    except ValueError:
+                        raise ValueError(
+                            f"Invalid value '{value}' for seq_len in dataset spec '{dataset}'. "
+                            f"Expected an integer."
+                        )
+                else:
+                    raise ValueError(
+                        f"Unsupported dataset option '{key}' in dataset spec '{dataset}'. "
+                        f"Only 'seq_len' is supported."
+                    )
+        else:
+            # No options or list dataset
+            self.dataset = dataset
+        
         self.tokenizer = tokenizer
         self.processor = processor
         if isinstance(ignored_scope, nncf.IgnoredScope):
