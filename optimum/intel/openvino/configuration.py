@@ -570,7 +570,7 @@ class OVQuantizationConfigBase(QuantizationConfigMixin):
                 A transformers processor used to process the dataset inputs.
         """
         self.num_samples = num_samples
-        
+
         # Parse dataset string for options
         self.dataset_kwargs = {}
         if isinstance(dataset, str) and ":" in dataset:
@@ -578,7 +578,7 @@ class OVQuantizationConfigBase(QuantizationConfigMixin):
             parts = dataset.split(":", 1)
             self.dataset = parts[0]
             options_str = parts[1]
-            
+
             # Parse options
             for option in options_str.split(","):
                 option = option.strip()
@@ -592,7 +592,7 @@ class OVQuantizationConfigBase(QuantizationConfigMixin):
                 key, value = option.split("=", 1)
                 key = key.strip()
                 value = value.strip()
-                
+
                 # Validate and parse known options
                 if key == "seq_len":
                     try:
@@ -610,7 +610,7 @@ class OVQuantizationConfigBase(QuantizationConfigMixin):
         else:
             # No options or list dataset
             self.dataset = dataset
-        
+
         self.tokenizer = tokenizer
         self.processor = processor
         if isinstance(ignored_scope, nncf.IgnoredScope):

@@ -277,9 +277,7 @@ class OVCalibrationDatasetBuilder:
             raise ValueError("Please provide a dataset for calibration.")
 
         if isinstance(self.model, OVModelForCausalLM):
-            return self._prepare_causal_lm_calibration_data(
-                config, seq_len=config.dataset_kwargs.get("seq_len")
-            )
+            return self._prepare_causal_lm_calibration_data(config, seq_len=config.dataset_kwargs.get("seq_len"))
         elif isinstance(
             self.model,
             (OVModelForVisualCausalLM, _OVModelForWhisper, OVModelForZeroShotImageClassification, OVSamModel),
@@ -1029,9 +1027,11 @@ class OVCalibrationDatasetBuilder:
                         # Replace a random token with a mask token
                         inputs["input_ids"][0, random_positions[len(calibration_data)]] = tokenizer.mask_token_id
 
-                self.model(inputs) if is_sentence_transformers_available() and isinstance(
-                    self.model, OVSentenceTransformer
-                ) else self.model(**inputs)
+                (
+                    self.model(inputs)
+                    if is_sentence_transformers_available() and isinstance(self.model, OVSentenceTransformer)
+                    else self.model(**inputs)
+                )
 
                 pbar.update(min(num_samples, len(calibration_data)) - pbar.n)
                 if len(calibration_data) >= num_samples:

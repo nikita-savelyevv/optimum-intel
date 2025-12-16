@@ -15,10 +15,8 @@
 """Integration tests for dataset option parsing with calibration data preparation."""
 
 import unittest
-from unittest.mock import Mock, MagicMock, patch
 
 from optimum.intel.openvino.configuration import OVQuantizationConfigBase
-from optimum.intel.openvino.quantization import OVCalibrationDatasetBuilder
 
 
 class TestDatasetIntegration(unittest.TestCase):
@@ -26,51 +24,35 @@ class TestDatasetIntegration(unittest.TestCase):
 
     def test_causal_lm_seq_len_from_dataset_kwargs(self):
         """Test that seq_len from dataset_kwargs is used in causal LM calibration."""
-        config = OVQuantizationConfigBase(
-            dataset="wikitext2:seq_len=256",
-            tokenizer="gpt2",
-            num_samples=2
-        )
-        
+        config = OVQuantizationConfigBase(dataset="wikitext2:seq_len=256", tokenizer="gpt2", num_samples=2)
+
         # Verify parsing
         self.assertEqual(config.dataset, "wikitext2")
         self.assertEqual(config.dataset_kwargs, {"seq_len": 256})
 
     def test_gsm8k_custom_seq_len_overrides_default(self):
         """Test that custom seq_len for gsm8k overrides the default 256."""
-        config = OVQuantizationConfigBase(
-            dataset="gsm8k:seq_len=512",
-            tokenizer="gpt2",
-            num_samples=2
-        )
-        
+        config = OVQuantizationConfigBase(dataset="gsm8k:seq_len=512", tokenizer="gpt2", num_samples=2)
+
         # Verify parsing
         self.assertEqual(config.dataset, "gsm8k")
         self.assertEqual(config.dataset_kwargs, {"seq_len": 512})
 
     def test_text_to_text_seq_len_from_kwargs(self):
         """Test that seq_len can be passed via dataset_kwargs to text-to-text helper."""
-        config = OVQuantizationConfigBase(
-            dataset="c4:seq_len=256",
-            tokenizer="t5-small",
-            num_samples=2
-        )
-        
+        config = OVQuantizationConfigBase(dataset="c4:seq_len=256", tokenizer="t5-small", num_samples=2)
+
         # Verify parsing
         self.assertEqual(config.dataset, "c4")
         self.assertEqual(config.dataset_kwargs, {"seq_len": 256})
-        
+
         # The helper should receive seq_len=256 as a keyword argument
         # when unpacking **config.dataset_kwargs
 
     def test_text_encoder_seq_len_from_kwargs(self):
         """Test that seq_len can be passed via dataset_kwargs to text encoder helper."""
-        config = OVQuantizationConfigBase(
-            dataset="wikitext:seq_len=64",
-            tokenizer="bert-base-uncased",
-            num_samples=2
-        )
-        
+        config = OVQuantizationConfigBase(dataset="wikitext:seq_len=64", tokenizer="bert-base-uncased", num_samples=2)
+
         # Verify parsing
         self.assertEqual(config.dataset, "wikitext")
         self.assertEqual(config.dataset_kwargs, {"seq_len": 64})
@@ -82,18 +64,15 @@ class TestDatasetIntegration(unittest.TestCase):
             OVQuantizationConfigBase(dataset="gsm8k", tokenizer="gpt2"),
             OVQuantizationConfigBase(dataset="c4", tokenizer="t5-small"),
         ]
-        
+
         for config in configs:
             self.assertEqual(config.dataset_kwargs, {})
 
     def test_list_dataset_backward_compatibility(self):
         """Test that list datasets work unchanged."""
         dataset_list = ["This is text 1", "This is text 2"]
-        config = OVQuantizationConfigBase(
-            dataset=dataset_list,
-            tokenizer="gpt2"
-        )
-        
+        config = OVQuantizationConfigBase(dataset=dataset_list, tokenizer="gpt2")
+
         self.assertEqual(config.dataset, dataset_list)
         self.assertEqual(config.dataset_kwargs, {})
 
