@@ -670,7 +670,6 @@ class OVCalibrationDatasetBuilder:
         from optimum.gptq.data import get_dataset, prepare_dataset
 
         seq_len = seq_len or config.dataset_kwargs.get("seq_len")
-
         tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=self.trust_remote_code)
         nsamples = config.num_samples if config.num_samples else 128
         if isinstance(config.dataset, str):
