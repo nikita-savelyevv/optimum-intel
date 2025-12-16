@@ -1027,11 +1027,9 @@ class OVCalibrationDatasetBuilder:
                         # Replace a random token with a mask token
                         inputs["input_ids"][0, random_positions[len(calibration_data)]] = tokenizer.mask_token_id
 
-                (
-                    self.model(inputs)
-                    if is_sentence_transformers_available() and isinstance(self.model, OVSentenceTransformer)
-                    else self.model(**inputs)
-                )
+                self.model(inputs) if is_sentence_transformers_available() and isinstance(
+                    self.model, OVSentenceTransformer
+                ) else self.model(**inputs)
 
                 pbar.update(min(num_samples, len(calibration_data)) - pbar.n)
                 if len(calibration_data) >= num_samples:
