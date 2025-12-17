@@ -571,9 +571,12 @@ class OVQuantizationConfigBase(QuantizationConfigMixin):
         """
         self.num_samples = num_samples
 
-        # Parse dataset string for options
-        self.dataset_kwargs = {}
-        if isinstance(dataset, str) and ":" in dataset:
+        # Handle dataset_kwargs from deserialization (backward compatibility)
+        # Extract it from kwargs if present, otherwise initialize as empty dict
+        self.dataset_kwargs = kwargs.pop("dataset_kwargs", {})
+        
+        # Parse dataset string for options (only if not already provided via kwargs)
+        if not self.dataset_kwargs and isinstance(dataset, str) and ":" in dataset:
             # Parse dataset with options: "dataset_name:key1=value1,key2=value2"
             parts = dataset.split(":", 1)
             self.dataset = parts[0]

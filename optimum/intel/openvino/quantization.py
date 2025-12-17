@@ -277,7 +277,10 @@ class OVCalibrationDatasetBuilder:
             raise ValueError("Please provide a dataset for calibration.")
 
         if isinstance(self.model, OVModelForCausalLM):
-            return self._prepare_causal_lm_calibration_data(config, seq_len=config.dataset_kwargs.get("seq_len"))
+            kwargs = {}
+            if "seq_len" in config.dataset_kwargs:
+                kwargs["seq_len"] = config.dataset_kwargs["seq_len"]
+            return self._prepare_causal_lm_calibration_data(config, **kwargs)
         elif isinstance(
             self.model,
             (OVModelForVisualCausalLM, _OVModelForWhisper, OVModelForZeroShotImageClassification, OVSamModel),
@@ -508,9 +511,10 @@ class OVCalibrationDatasetBuilder:
             elif isinstance(self.model, _OVModelForWhisper):
                 return self._prepare_speech_to_text_calibration_data(quantization_config, dataset)
             elif isinstance(self.model, OVModelForSeq2SeqLM):
-                return self._prepare_text_to_text_calibration_data(
-                    quantization_config, dataset, seq_len=quantization_config.dataset_kwargs.get("seq_len")
-                )
+                kwargs = {}
+                if "seq_len" in quantization_config.dataset_kwargs:
+                    kwargs["seq_len"] = quantization_config.dataset_kwargs["seq_len"]
+                return self._prepare_text_to_text_calibration_data(quantization_config, dataset, **kwargs)
             elif is_diffusers_available() and isinstance(self.model, OVDiffusionPipeline):
                 return self._prepare_diffusion_calibration_data(quantization_config, dataset)
             elif (
@@ -518,13 +522,15 @@ class OVCalibrationDatasetBuilder:
                 or is_sentence_transformers_available()
                 and isinstance(self.model, OVSentenceTransformer)
             ):
-                return self._prepare_text_encoder_model_calibration_data(
-                    quantization_config, dataset, seq_len=quantization_config.dataset_kwargs.get("seq_len")
-                )
+                kwargs = {}
+                if "seq_len" in quantization_config.dataset_kwargs:
+                    kwargs["seq_len"] = quantization_config.dataset_kwargs["seq_len"]
+                return self._prepare_text_encoder_model_calibration_data(quantization_config, dataset, **kwargs)
             elif isinstance(self.model, OVModelForZeroShotImageClassification):
-                return self._prepare_text_image_encoder_model_calibration_data(
-                    quantization_config, dataset, seq_len=quantization_config.dataset_kwargs.get("seq_len")
-                )
+                kwargs = {}
+                if "seq_len" in quantization_config.dataset_kwargs:
+                    kwargs["seq_len"] = quantization_config.dataset_kwargs["seq_len"]
+                return self._prepare_text_image_encoder_model_calibration_data(quantization_config, dataset, **kwargs)
             elif isinstance(self.model, OVSamModel):
                 return self._prepare_sam_dataset(quantization_config, dataset)
             else:
