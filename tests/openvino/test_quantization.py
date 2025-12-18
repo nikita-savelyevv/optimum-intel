@@ -672,6 +672,23 @@ class OVWeightCompressionTest(unittest.TestCase):
                 bits=4,
                 sym=True,
                 group_size=16,
+                num_samples=1,
+                ratio=0.8,
+                sensitivity_metric="mean_activation_magnitude",
+                dataset="c4:seq_len=64",
+                quant_method=QuantizationMethod.AWQ,
+                scale_estimation=True,
+            ),
+            {"model": {"int8": 8, "int4": 12}},
+        ),
+        (
+            OVModelForCausalLM,
+            "llama_awq",
+            False,
+            dict(
+                bits=4,
+                sym=True,
+                group_size=16,
                 quant_method=QuantizationMethod.AWQ,
             ),
             {"model": {"int8": 4, "int4": 14}},
@@ -1431,6 +1448,59 @@ class OVWeightCompressionTest(unittest.TestCase):
             openvino_config = OVConfig.from_pretrained(tmp_dir, device=OPENVINO_DEVICE)
             self.assertEqual(openvino_config.quantization_config.bits, 4)
             self.assertEqual(openvino_config.dtype, quantization_config.dtype)
+
+    def test_dataset_seq_len_option_passed_to_get_dataset(self):
+        """Test that seq_len from dataset option is correctly passed to get_dataset."""
+        from unittest.mock import patch, MagicMock
+        
+        model_id = MODEL_NAMES["gpt2"]
+        task = OVModelForCausalLM.export_feature
+        
+        with TemporaryDirectory() as tmp_dir:
+            # Export and load the model
+            transformers_model = OVModelForCausalLM.from_pretrained(model_id, export=True, stateful=False)
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            
+            quantizer = OVQuantizer.from_pretrained(transformers_model, task=task, device=OPENVINO_DEVICE)
+            
+            # Create config with seq_len option - using 64 instead of default 32
+            quantization_config = OVWeightQuantizationConfig(
+                bits=4,
+                sym=True,
+                group_size=64,
+                dataset="wikitext2:seq_len=64",
+                tokenizer=model_id,
+                num_samples=1,
+            )
+            
+            # Patch get_dataset to capture the seqlen parameter
+            with patch("optimum.gptq.data.get_dataset") as mock_get_dataset:
+                # Setup mock to return a minimal dataset
+                mock_get_dataset.return_value = [{"input_ids": torch.tensor([[1, 2, 3]])}]
+                
+                try:
+                    quantizer.quantize(save_directory=tmp_dir, ov_config=OVConfig(quantization_config=quantization_config))
+                except Exception:
+                    # Quantization might fail, but we only care about the get_dataset call
+                    pass
+                
+                # Verify that get_dataset was called
+                self.assertTrue(mock_get_dataset.called, "get_dataset should have been called")
+                
+                # Get the actual call arguments
+                call_args = mock_get_dataset.call_args
+                
+                # Verify that seqlen parameter was passed and is not the default value of 32
+                if call_args is not None:
+                    # Check if seqlen was passed as a keyword argument
+                    if "seqlen" in call_args.kwargs:
+                        actual_seqlen = call_args.kwargs["seqlen"]
+                        self.assertEqual(actual_seqlen, 64, 
+                                       f"Expected seq_len to be 64 (from dataset option), but got {actual_seqlen}")
+                        self.assertNotEqual(actual_seqlen, 32, 
+                                          "seq_len should not be the default value of 32")
 
 
 class OVPipelineQuantizationTest(unittest.TestCase):
@@ -2317,3 +2387,87 @@ def check_model_inference(ov_model, model_id, trust_remote_code):
         ov_model(**inputs)
     else:
         raise Exception("Unexpected model class.")
+
+
+class TestDatasetParsing(unittest.TestCase):
+    """Test suite for dataset option parsing in OVQuantizationConfigBase."""
+
+    def test_dataset_no_options(self):
+        """Test that a simple dataset name without options is preserved."""
+        config = OVQuantizationConfigBase(dataset="wikitext")
+        self.assertEqual(config.dataset, "wikitext")
+        self.assertEqual(config.dataset_kwargs, {})
+
+    def test_dataset_with_seq_len_option(self):
+        """Test parsing of seq_len option from dataset string."""
+        config = OVQuantizationConfigBase(dataset="wikitext:seq_len=128")
+        self.assertEqual(config.dataset, "wikitext")
+        self.assertEqual(config.dataset_kwargs, {"seq_len": 128})
+
+    def test_dataset_gsm8k_with_seq_len(self):
+        """Test parsing of seq_len option for gsm8k dataset."""
+        config = OVQuantizationConfigBase(dataset="gsm8k:seq_len=512")
+        self.assertEqual(config.dataset, "gsm8k")
+        self.assertEqual(config.dataset_kwargs, {"seq_len": 512})
+
+    def test_dataset_with_multiple_spaces(self):
+        """Test parsing with spaces around the option."""
+        config = OVQuantizationConfigBase(dataset="wikitext:seq_len = 64")
+        self.assertEqual(config.dataset, "wikitext")
+        self.assertEqual(config.dataset_kwargs, {"seq_len": 64})
+
+    def test_dataset_list_no_parsing(self):
+        """Test that list datasets skip parsing and remain unchanged."""
+        dataset_list = ["sample text 1", "sample text 2", "sample text 3"]
+        config = OVQuantizationConfigBase(dataset=dataset_list)
+        self.assertEqual(config.dataset, dataset_list)
+        self.assertEqual(config.dataset_kwargs, {})
+
+    def test_dataset_unsupported_option(self):
+        """Test that unsupported options raise ValueError."""
+        with pytest.raises(ValueError) as exc_info:
+            OVQuantizationConfigBase(dataset="wikitext:foo=bar")
+        assert "Unsupported dataset option 'foo'" in str(exc_info.value)
+        assert "Only 'seq_len' is supported" in str(exc_info.value)
+
+    def test_dataset_malformed_option_no_equals(self):
+        """Test that options without '=' raise ValueError."""
+        with pytest.raises(ValueError) as exc_info:
+            OVQuantizationConfigBase(dataset="wikitext:seq_len")
+        assert "Malformed dataset option" in str(exc_info.value)
+        assert "Expected format: 'key=value'" in str(exc_info.value)
+
+    def test_dataset_invalid_seq_len_value(self):
+        """Test that non-integer seq_len values raise ValueError."""
+        with pytest.raises(ValueError) as exc_info:
+            OVQuantizationConfigBase(dataset="wikitext:seq_len=abc")
+        assert "Invalid value 'abc' for seq_len" in str(exc_info.value)
+        assert "Expected an integer" in str(exc_info.value)
+
+    def test_dataset_empty_string_option(self):
+        """Test that empty seq_len value raises ValueError."""
+        with pytest.raises(ValueError) as exc_info:
+            OVQuantizationConfigBase(dataset="wikitext:seq_len=")
+        assert "Invalid value '' for seq_len" in str(exc_info.value)
+
+    def test_dataset_none(self):
+        """Test that None dataset is handled correctly."""
+        config = OVQuantizationConfigBase(dataset=None)
+        self.assertIsNone(config.dataset)
+        self.assertEqual(config.dataset_kwargs, {})
+
+    def test_dataset_with_colon_in_name_only(self):
+        """Test handling of dataset string with trailing colon but no options."""
+        config = OVQuantizationConfigBase(dataset="wikitext:")
+        self.assertEqual(config.dataset, "wikitext")
+        self.assertEqual(config.dataset_kwargs, {})
+
+    def test_backward_compatibility_no_options(self):
+        """Test that datasets without options work as before."""
+        configs = [
+            OVQuantizationConfigBase(dataset="wikitext2", tokenizer="gpt2"),
+            OVQuantizationConfigBase(dataset="gsm8k", tokenizer="gpt2"),
+            OVQuantizationConfigBase(dataset="c4", tokenizer="t5-small"),
+        ]
+        for config in configs:
+            self.assertEqual(config.dataset_kwargs, {})
