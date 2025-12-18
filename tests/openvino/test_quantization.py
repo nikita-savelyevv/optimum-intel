@@ -1449,6 +1449,59 @@ class OVWeightCompressionTest(unittest.TestCase):
             self.assertEqual(openvino_config.quantization_config.bits, 4)
             self.assertEqual(openvino_config.dtype, quantization_config.dtype)
 
+    def test_dataset_seq_len_option_passed_to_get_dataset(self):
+        """Test that seq_len from dataset option is correctly passed to get_dataset."""
+        from unittest.mock import patch, MagicMock
+        
+        model_id = MODEL_NAMES["gpt2"]
+        task = OVModelForCausalLM.export_feature
+        
+        with TemporaryDirectory() as tmp_dir:
+            # Export and load the model
+            transformers_model = OVModelForCausalLM.from_pretrained(model_id, export=True, stateful=False)
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            
+            quantizer = OVQuantizer.from_pretrained(transformers_model, task=task, device=OPENVINO_DEVICE)
+            
+            # Create config with seq_len option - using 64 instead of default 32
+            quantization_config = OVWeightQuantizationConfig(
+                bits=4,
+                sym=True,
+                group_size=64,
+                dataset="wikitext2:seq_len=64",
+                tokenizer=model_id,
+                num_samples=1,
+            )
+            
+            # Patch get_dataset to capture the seqlen parameter
+            with patch("optimum.gptq.data.get_dataset") as mock_get_dataset:
+                # Setup mock to return a minimal dataset
+                mock_get_dataset.return_value = [{"input_ids": torch.tensor([[1, 2, 3]])}]
+                
+                try:
+                    quantizer.quantize(save_directory=tmp_dir, ov_config=OVConfig(quantization_config=quantization_config))
+                except Exception:
+                    # Quantization might fail, but we only care about the get_dataset call
+                    pass
+                
+                # Verify that get_dataset was called
+                self.assertTrue(mock_get_dataset.called, "get_dataset should have been called")
+                
+                # Get the actual call arguments
+                call_args = mock_get_dataset.call_args
+                
+                # Verify that seqlen parameter was passed and is not the default value of 32
+                if call_args is not None:
+                    # Check if seqlen was passed as a keyword argument
+                    if "seqlen" in call_args.kwargs:
+                        actual_seqlen = call_args.kwargs["seqlen"]
+                        self.assertEqual(actual_seqlen, 64, 
+                                       f"Expected seq_len to be 64 (from dataset option), but got {actual_seqlen}")
+                        self.assertNotEqual(actual_seqlen, 32, 
+                                          "seq_len should not be the default value of 32")
+
 
 class OVPipelineQuantizationTest(unittest.TestCase):
     maxDiff = None
